@@ -112,6 +112,31 @@ class ApiTests(unittest.TestCase):
             self.assertLess(trace.index('network'),trace.index('ETHUSDT'))
         asyncio.run(check())
 
+    def test_network_runs_during_slow_inference_and_inference_is_serial(self):
+        import asyncio
+        import threading
+        a=self.app
+        async def check():
+            release=threading.Event();started=threading.Event();calls=[]
+            def infer(symbol,candles):
+                calls.append(symbol);started.set();release.wait(2)
+                return {'symbol':symbol}
+            with patch.object(a,'inference_lock',asyncio.Lock()),patch.object(a.coin_engine,'infer',side_effect=infer):
+                first=asyncio.create_task(a.infer_async('BTCUSDT',[]))
+                second=asyncio.create_task(a.infer_async('ETHUSDT',[]))
+                try:
+                    for _ in range(100):
+                        if started.is_set():break
+                        await asyncio.sleep(.005)
+                    self.assertTrue(started.is_set())
+                    self.assertFalse(first.done(), 'network loop blocked until inference ended')
+                    self.assertEqual(calls,['BTCUSDT'])
+                finally:
+                    release.set()
+                    results=await asyncio.gather(first,second)
+                self.assertEqual([x['symbol'] for x in results],['BTCUSDT','ETHUSDT'])
+        asyncio.run(check())
+
     def test_all_views_use_the_same_dynamic_entry_gate(self):
         import asyncio
         a=self.app;now=time.time();p=prediction();p['candle_time']=int(now*1000)-1_000_000
@@ -147,5 +172,18 @@ class ApiTests(unittest.TestCase):
         with self.assertRaises(HTTPException) as exc:
             asyncio.run(a.rollback('BTCUSDT','bad',None))
         self.assertEqual(exc.exception.status_code,403)
+
+    def test_market_timestamp_metadata_and_future_quote_rejection(self):
+        import asyncio
+        a=self.app;now=time.time()
+        with patch.object(a,'universe',{'BTCUSDT':{'base':'BTC','quote':'USDT'}}),patch.object(a,'signals',{}),patch.object(a,'_live_symbols',return_value=[]),patch.object(a,'tickers',{'BTCUSDT':dict(quote(),updated_at=now-20)}):
+            result=asyncio.run(a.markets(limit=20))
+            self.assertIsInstance(result['server_time'],int)
+            self.assertEqual(result['rows'][0]['quote_quality']['status'],'stale')
+            self.assertEqual(result['rows'][0]['price'],100)
+            a.tickers['BTCUSDT']['updated_at']=now+3600
+            result=asyncio.run(a.markets(limit=20))
+            self.assertEqual(result['rows'][0]['quote_quality']['status'],'future')
+            self.assertIsNone(result['rows'][0]['price'])
 
 if __name__=='__main__':unittest.main()

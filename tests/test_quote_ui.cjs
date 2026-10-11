@@ -1,0 +1,30 @@
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+let monotonic=0;
+const nodes=new Map();
+const context=vm.createContext({console,Intl,Date,Map,Number,performance:{now:()=>monotonic},
+  setInterval:()=>{},document:{addEventListener:()=>{},getElementById:id=>nodes.get(id)}});
+const src=fs.readFileSync('source/static/app.js','utf8').split("for(let btn of document.querySelectorAll('.nav'))")[0];
+vm.runInContext(src,context);
+const run=s=>vm.runInContext(s,context);
+run("syncServerClock(1800000000000);state.rows=[{symbol:'BTCUSDT',price:100,quote_updated_at:'2027-01-15T07:59:59.000Z'}]");
+assert.equal(run('quoteStamp(state.rows[0].quote_updated_at)'),1799999999);
+assert.equal(run('quoteLabel(state.rows[0])'),'Güncel · 1 sn');
+monotonic=10000;
+assert.equal(run('quoteLabel(state.rows[0])'),'Gecikmiş · 11 sn');
+// Device clock changes must not affect ages; only monotonic elapsed/server time.
+run('Date.now=()=>0');
+assert.equal(run('quoteLabel(state.rows[0])'),'Gecikmiş · 11 sn');
+run("applyQuoteChanges({BTCUSDT:[99,0,100,1799999998]})");
+assert.equal(run('state.rows[0].price'),100,'ISO snapshot must reject an older numeric event');
+run("applyQuoteChanges({BTCUSDT:[101,0,100,1800000009]})");
+assert.equal(run('state.rows[0].price'),101);
+assert.equal(run('quoteLabel(state.rows[0])'),'Güncel · 1 sn');
+run("applyQuoteChanges({BTCUSDT:[102,0,100,1800000011]})");
+assert.equal(run('state.rows[0].price'),101,'future event rejected');
+run('syncServerClock(1799999900000)');
+assert.equal(run('quoteNow()'),1800000010,'late HTTP response cannot rewind clock');
+monotonic=150000;
+assert.match(run('quoteLabel(state.rows[0])'),/^Gecikmiş/,'silent feed must age without another tick');
+console.log('Quote UI regression checks passed');
