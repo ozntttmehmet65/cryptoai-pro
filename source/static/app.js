@@ -22,6 +22,13 @@ function navigate(page){state.page=page;document.querySelectorAll('.page').forEa
 function setError(message){let el=$('siteError');el.textContent=message||'';el.classList.toggle('hidden',!message)}
 function setChip(id,ready,text){let el=$(id);if(!el)return;el.className='chip '+(ready?'green':'amber');el.textContent=text}
 function paintHealth(h){state.health=h;let ready=h.provider_ok&&h.model_ready;
+  const monitor=h.execution_monitor||{};
+  setText('bookCoverage',`${monitor.fresh_books||0} / ${monitor.total_symbols||0}`);
+  setText('entryCandidates',String(monitor.active_candidates||0));setText('entryPassed',String(monitor.entry_passed||0));
+  setText('bookConnection',monitor.book_stream||'Bekleniyor');
+  setChip('executionChip',monitor.fresh_books>0,monitor.fresh_books>0?'GİRİŞ POLİTİKASI AKTİF':'VERİ BEKLENİYOR');
+  $('executionReasons').replaceChildren(...(monitor.veto_reasons||[]).map(x=>elem('p',{},`${x.count} aday · ${x.reason}`)));
+  if(!(monitor.veto_reasons||[]).length)setText('executionReasons','Engellenen güncel model adayı yok. Sinyal üretmek için doğrulanmış model ve yeni kapanmış mum gerekir.');
   setText('statAll',h.symbol_count?String(h.symbol_count):'—');const actual=h.signal_decisions_ready||0;
   setText('statCoverage',h.symbol_count?`${Math.round(actual/h.symbol_count*100)}%`:'—');
   $('coverageProgress').style.width=(h.symbol_count?Math.min(100,actual/h.symbol_count*100):0)+'%';setText('coverageText',`${actual} / ${h.symbol_count}`);
@@ -239,16 +246,26 @@ function paintPrediction(pred,unified){
   setText('pLong',u.long_score==null?'—':n(u.long_score,0)+'/100');setText('pShort',u.short_score==null?'—':n(u.short_score,0)+'/100');setText('pWait',u.status||'BEKLE');
   $('barLong').style.width=(u.long_score||0)+'%';$('barShort').style.width=(u.short_score||0)+'%';$('barWait').style.width=u.status==='BEKLE'?'100%':'0%';
   const c=u.components||{},tech=pred?.technical||{}, audit=pred?.execution_quality;
-  setText('entryAudit',audit?`Giriş denetimi: ${audit.approved?'GEÇTİ':'BEKLE'} · Referanstan uzaklık ${n(audit.reference_departure_atr,2)} ATR · Varsayılan maliyet sonrası ödül / risk ${n(audit.assumed_net_risk_reward,2)} · ${(audit.reasons||[]).join(' · ')}`:'Güncel giriş denetimi bekleniyor.');
+  $('entryChecks').replaceChildren(...(audit?.checks||[]).map(c=>elem('span',{className:'chip '+(c.passed?'green':'amber')},`${({quote:'Fiyat',candle:'Mum',departure:'Giriş mesafesi',reward:'Maliyet',bracket:'TP/SL',book:'Alış/satış',spread:'Makas',liquidity:'Görünür tutar',executable:'Giriş fiyatı',stress:'Stres',model:'Model testi',drift:'Sonuç kilidi'})[c.id]||'Veri'} · ${c.passed?'GEÇTİ':'BEKLE'}`)));
+  setText('entryAudit',audit?`Giriş denetimi: ${audit.approved?'GEÇTİ':'BEKLE'} · Makas ${n(audit.spread_bps,2)} bp · Görünür üst kademe ${n(audit.min_top_notional_usdt,0)} USDT · Referanstan uzaklık ${n(audit.reference_departure_atr,2)} ATR · Varsayılan maliyet sonrası ödül / risk ${n(audit.assumed_net_risk_reward,2)} · ${(audit.reasons||[]).join(' · ')}`:'Güncel giriş denetimi bekleniyor.');
   setText('predTechnical',u.reason||'Birleşik değerlendirme bekleniyor');
   setText('predTechnical',(u.reason||'Birleşik değerlendirme bekleniyor')+' · AI '+n(c.ai,1)+' + teknik '+n(c.indicators,1)+' + 1s/4s '+n(c.higher_timeframe,1)+' + formasyon '+n(c.patterns,1)+' + tarihsel teyit '+n(c.tested_setup,1)+' - stres cezası '+n(c.risk_penalty,1)+' puan. '+(u.matching_patterns||[]).join(', ')+' · Bu puan TP başarı olasılığı DEĞİLDİR.');
   setText('entry',price(u.entry_reference));setText('stop',price(u.sl_estimate));setText('target',price(u.tp_estimate));setText('candleDate',pred?dt(pred.candle_time):'—');
+}
+function paintHoldoutAudit(validation){
+  const tbody=$('holdoutAuditRows');tbody.replaceChildren();
+  for(const side of ['LONG','SHORT']){const d=validation?.[side]?.holdout_audit?.independent_24h,tr=elem('tr');
+    tr.append(elem('td',{},side));
+    if(d)tr.append(elem('td',{},`${d.resolved} / ${d.signals}`),elem('td',{},prob(d.tp_rate)),elem('td',{},prob(d.wilson_lower_95)),elem('td',{},d.mean_stressed_net==null?'—':pct(d.mean_stressed_net*100)));
+    else tr.append(elem('td',{colspan:'4'},'Bir sonraki coin eğitiminde oluşacak'));
+    tbody.append(tr);
+  }
 }
 function paintHistory(items){let t=$('historyRows');t.replaceChildren();if(!items.length){let tr=elem('tr');tr.append(elem('td',{colspan:'5',className:'placeholder'},'Modelin kaydedilmiş sinyali henüz yok.'));t.append(tr);return}
  for(let i of items){let tr=elem('tr');tr.append(elem('td',{},dt(i.candle_time)),(()=>{let td=elem('td');td.append(signalTag(i.signal));return td})(),elem('td',{},prob(i.confidence)),elem('td',{},price(i.entry_reference)),elem('td',{className:'muted'},i.model_version));t.append(tr)}
 }
 async function loadDetail(){let nonce=++state.detailNonce;const s=state.selected,tf=state.period;setText('detailTitle',s);setText('chartCoin',s+' · '+tf);setText('selectedLivePrice','Canlı fiyat: '+price(state.rows.find(r=>r.symbol===s)?.price));$('symbolSelect').value=s;setText('chartCaption','Gerçek Binance '+tf+' mum grafiği');
-  try{let [detail,chart]=await Promise.all([api('/api/symbol/'+encodeURIComponent(s)),api('/api/candles/'+encodeURIComponent(s)+'?'+new URLSearchParams({interval:tf,limit:'100'}))]);if(nonce!==state.detailNonce)return;paintPrediction(detail.prediction,detail.unified);paintHistory(detail.history||[]);setText('chartSource',chart.source||'Binance REST');renderChart(chart.candles||[])}catch(e){if(nonce!==state.detailNonce)return;$('chartContainer').replaceChildren(elem('div',{className:'placeholder'},'Gerçek grafik alınamıyor: '+e.message));paintPrediction(null);paintHistory([])}
+  try{let [detail,chart]=await Promise.all([api('/api/symbol/'+encodeURIComponent(s)),api('/api/candles/'+encodeURIComponent(s)+'?'+new URLSearchParams({interval:tf,limit:'100'}))]);if(nonce!==state.detailNonce)return;paintPrediction(detail.prediction,detail.unified);paintHoldoutAudit(detail.directional_holdout);paintHistory(detail.history||[]);setText('chartSource',chart.source||'Binance REST');renderChart(chart.candles||[])}catch(e){if(nonce!==state.detailNonce)return;$('chartContainer').replaceChildren(elem('div',{className:'placeholder'},'Gerçek grafik alınamıyor: '+e.message));paintPrediction(null);paintHoldoutAudit({});paintHistory([])}
 }
 // Static SVG candlestick renderer, uses only real OHLC series from the server.
 function renderChart(candles){let holder=$('chartContainer');holder.replaceChildren();if(!candles||candles.length<10){holder.append(elem('div',{className:'placeholder'},'Yeterli mum verisi yok.'));return}
@@ -266,6 +283,8 @@ function renderChart(candles){let holder=$('chartContainer');holder.replaceChild
 async function loadPaper(){
   try{const response=await api('/api/paper?limit=200'), summary=response.summary||{},rows=response.rows||[];
     if($('siteError').textContent.startsWith('Sanal gözlemler alınamadı:'))setError('');
+    const v7=response.entry_policy_summary?.['V7.0']||{};
+    setText('paperPolicyNote',`V7.0 giriş politikasıyla ${v7.observed||0} onaylı gözlem, ${v7.closed||0} kapanmış sonuç. Önceki sürümlerin kayıtları tarihsel kanıttır; V7.0 başarısı olarak yorumlanamaz.`);
     setText('paperTotal',n(summary.observed,0));setText('paperClosed',n(summary.settled,0));
     setText('paperWin',summary.win_rate===null?'—':pct(summary.win_rate*100));
     setText('paperAverage',summary.mean_net_return===null?'—':pct(summary.mean_net_return*100));
