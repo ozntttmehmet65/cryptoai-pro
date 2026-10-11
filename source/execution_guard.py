@@ -10,7 +10,7 @@ STRESS_COST = 0.0040
 MAX_SPREAD_BPS = 8.0
 MAX_SPREAD_ATR_FRACTION = .10
 MIN_TOP_NOTIONAL = 1000.0
-POLICY_VERSION = "V7.1"
+POLICY_VERSION = "V7.2"
 
 
 def entry_check(pred, quote, now_ms, book=None):
@@ -84,6 +84,11 @@ def guarded_prediction(pred, quote, now_ms, permission, drift_blocked=False, *, 
             check['checks'].append({'id':'consensus','passed':agreement,'label':'Çoklu model oy uzlaşması'})
             if not agreement:
                 check['reasons'].append('Model oyları yeterince uzlaşmıyor; BEKLE')
+        if 'market_condition' in pred:
+            condition=pred.get('market_condition') or {}
+            regime_ok=condition.get('name') in ('UPTREND','DOWNTREND','RANGE') and (pred.get('regime_evidence') or {}).get('allowed') is True
+            check['checks'].append({'id':'regime','passed':regime_ok,'label':'Piyasa koşulunda bağımsız dönem kanıtı'})
+            if not regime_ok:check['reasons'].append('Bu piyasa koşulunda dönem kanıtı yok veya aşırı oynaklık var')
         check['checks'].append({'id':'model','passed':bool(permission),'label':'Bağımsız model yön testi'})
         check['checks'].append({'id':'drift','passed':not drift_blocked,'label':'Canlı yön ve coin/model sonuç kilidi'})
         if not permission:

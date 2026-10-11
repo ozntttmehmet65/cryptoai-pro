@@ -114,4 +114,17 @@ class ApiTests(unittest.TestCase):
             with patch.object(a,'_current_drift',return_value=True):
                 self.assertEqual(asyncio.run(a.symbol_detail('BTCUSDT'))['unified']['status'],'BEKLE')
 
+    def test_professional_report_and_rollback_auth(self):
+        import asyncio
+        import json
+        from fastapi import HTTPException
+        a=self.app
+        report=asyncio.run(a.professional_report())
+        self.assertEqual(report['release'],'V7.2')
+        self.assertEqual(report['calibration']['resolved_within_24h'],0)
+        json.dumps(report,allow_nan=False)
+        with self.assertRaises(HTTPException) as exc:
+            asyncio.run(a.rollback('BTCUSDT','bad',None))
+        self.assertEqual(exc.exception.status_code,403)
+
 if __name__=='__main__':unittest.main()

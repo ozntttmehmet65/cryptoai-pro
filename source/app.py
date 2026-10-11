@@ -21,7 +21,10 @@ from archive_client import ArchiveClient, last_complete_month
 from market_stream import ticker_worker, parse_books, BOOK_URL, merge_ordered
 from live_candles import (kline_worker, selected_symbols, setup as setup_live,
                           store_bars, contiguous_recent, freshness_ok, seed_recent_rest)
-from paper_trade import setup as setup_paper, observe as observe_paper, settle as settle_paper, reconcile_quotes, report as paper_report
+from paper_trade import setup as setup_paper, settle as settle_paper, reconcile_quotes, report as historical_paper_report
+import execution_paper
+import quality_report
+from professional import POLICY as PROFESSIONAL_POLICY, HISTORY_TARGET, correlation_groups
 from quality_guard import live_drift_block
 from execution_guard import guarded_prediction
 from ml_engine import ModelEngine
@@ -37,7 +40,7 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(ROOT / "data"))).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TRAIN_SYMBOLS = max(3, min(int(os.environ.get("TRAIN_SYMBOLS", "30")), 45))
-TRAIN_CANDLES = max(1500, min(int(os.environ.get("TRAIN_CANDLES", "4500")), 4500))
+TRAIN_CANDLES = max(9000, min(int(os.environ.get("PRO_TRAIN_CANDLES", "18000")), HISTORY_TARGET))
 SCAN_INTERVAL = max(20., float(os.environ.get("SCAN_INTERVAL_SECONDS", "25")))
 ENABLE_REST_SCANNER = os.environ.get("ENABLE_REST_SCANNER", "false").lower() == "true"
 AUTO_TRAIN = os.environ.get("AUTO_TRAIN", "true").lower() == "true"
@@ -79,6 +82,8 @@ db.execute("CREATE TABLE IF NOT EXISTS signals (symbol TEXT, candle_time INTEGER
            "PRIMARY KEY(symbol, candle_time, model_version))")
 db.commit()
 setup_paper(db)
+execution_paper.setup(db)
+quality_report.setup(db)
 setup_live(db)
 closed_queue = asyncio.Queue(maxsize=1200)
 
@@ -120,7 +125,7 @@ def _load_snapshot():
 
 
 async def _training_bars(symbol: str):
-    """Use up to 4500 genuine 15m candles; fetch older pages sequentially.
+    """Use up to 18000 genuine 15m candles; four older pages per due coin.
 
     Binance REST caps a page at 1500; older data must be fetched with endTime,
     and all requests use the existing global 2.1s limiter / circuit breaker.
@@ -145,7 +150,10 @@ async def _training_bars(symbol: str):
     age=now-saved_at
     # With a valid cache, a restart must not repeat an enormous REST scan.
     if saved and 0<=age<3*3600 and len(saved)>=TRAIN_CANDLES:
-        return saved[-TRAIN_CANDLES:]
+        merged=saved[-TRAIN_CANDLES:]
+        cut=len(merged)-1
+        while cut>0 and merged[cut]['time']-merged[cut-1]['time']==900000:cut-=1
+        return merged[cut:]
     merged=list(saved)
     if not saved or age>=3*3600 or len(saved)<1500:
         recent_count=(min(TRAIN_CANDLES,1500)
@@ -163,7 +171,7 @@ async def _training_bars(symbol: str):
                  or previous_target < TRAIN_CANDLES)):
         previous_attempt=int(now)
         previous_target=TRAIN_CANDLES
-        for _ in range(3):  # bounded: max 4500 candles -> at most 2 older pages
+        for _ in range(4):  # Bounded backfill; continue on a later daily attempt.
             if len(merged)>=TRAIN_CANDLES:
                 break
             oldest=int(merged[0]["time"])
@@ -175,12 +183,19 @@ async def _training_bars(symbol: str):
                 break
             clean.update(extra)
             merged=[clean[k] for k in sorted(clean)][-TRAIN_CANDLES:]
+            # Preserve each successful page if a later request is interrupted.
+            _atomic_json(f,{"symbol":symbol,"fetched_at":int(now),
+                            "older_backfill_attempted_at":previous_attempt,
+                            "older_backfill_target_count":previous_target,"candles":merged})
             if len(earlier)<min(1500,TRAIN_CANDLES-len(merged)) and len(extra)<100:
                 break
     _atomic_json(f,{"symbol":symbol,"fetched_at":int(now),
                     "older_backfill_attempted_at":previous_attempt,
                     "older_backfill_target_count":previous_target,"candles":merged})
-    return merged
+    # Keep only the latest consecutive real segment, never fill a history gap.
+    cut=len(merged)-1
+    while cut>0 and merged[cut]['time']-merged[cut-1]['time']==900000:cut-=1
+    return merged[cut:]
 
 
 async def refresh_market():
@@ -226,7 +241,18 @@ def _stream_prices(updates):
 
 
 def _stream_books(updates):
-    merge_ordered(books, updates)
+    updates=merge_ordered(books, updates)
+    if not updates:return
+    try:
+        now_ms=int(time.time()*1000)
+        changed=execution_paper.reconcile_books(db,updates,now_ms)
+        if changed:_drift_cache.clear();_quality_cache.clear()
+        for symbol in updates:
+            pred=_active_prediction(symbol,now_ms)
+            if pred and pred.get('signal') in ('LONG','SHORT'):
+                observe_paper(db,symbol,pred,None,now_ms)
+    except Exception as exc:
+        log.warning('Bid/ask paper observation failed: %s',str(exc)[:180])
 
 def _book_status(value):
     status["book_source"] = "WebSocket: " + value
@@ -337,6 +363,19 @@ async def history_warm_worker():
 
 
 _drift_cache = {}
+_quality_cache = {}
+
+
+def observe_paper(db,symbol,pred,observed_price,now_ms,*,shadow=False):
+    created=execution_paper.observe(db,symbol,pred,books.get(symbol),now_ms,shadow=shadow)
+    if created:
+        quality_report.record(db,symbol,pred,now_ms)
+        _quality_cache.clear()
+    return created
+
+
+def paper_report(db,limit=100):
+    return execution_paper.report(db,limit,historical=historical_paper_report(db,limit))
 
 def _current_drift(side, now_ms, symbol=None, version=None):
     key=(side,symbol,version)
@@ -375,6 +414,8 @@ def _save_signal(symbol, inf, bars, now_ms, source):
                 inf["entry_reference"],inf["model_version"]))
     db.commit()
     inf = _guard(symbol, inf, now_ms)
+    quality_report.record(db,symbol,inf,now_ms)
+    _quality_cache.clear()
     quote=tickers.get(symbol)
     if quote and 0<=time.time()-quote.get("updated_at",0)<10:
         if inf["signal"] in ("LONG", "SHORT"):
@@ -549,7 +590,7 @@ async def coin_training_worker():
         if not COIN_AUTO_TRAIN or not universe:
             await asyncio.sleep(30)
             continue
-        symbols = sorted(universe, key=lambda s: (coin_engine.ensemble_ready(s),
+        symbols = sorted(universe, key=lambda s: (coin_engine.professional_ready(s),
                          -tickers.get(s,{}).get("quote_volume",0)))
         force = bool(status["coin_force_refresh"])
         status["coin_force_refresh"] = False
@@ -572,13 +613,14 @@ async def coin_training_worker():
             last_attempt[symbol] = now
             status["coin_training_current"] = symbol
             status["model_training"] = True
-            status["training_stage"] = f"Çoklu model oylaması eğitiliyor: {symbol}"
+            status["training_stage"] = f"Profesyonel dönem ve oylama eğitimi: {symbol}"
             try:
                 bars = await _training_bars(symbol)
                 info = await asyncio.to_thread(coin_engine.fit, symbol, bars)
                 status["coin_training_success"] += 1
                 status["coin_training_last"] = {"symbol":symbol,"version":info["version"],
-                                                 "at":info["trained_at"]}
+                                                 "at":info["trained_at"],"promotion":info.get('promotion'),
+                                                 "history_count":info.get('historical_candles_used')}
                 status["coin_last_failure"] = None
                 failures.pop(symbol,None)
                 status["coin_failure_reasons"].pop(symbol, None)
@@ -630,6 +672,54 @@ async def auto_training_worker():
         await asyncio.sleep(180)
 
 
+async def funding_worker():
+    """Only positions needing certified funding coverage use shared REST pacing."""
+    while True:
+        try:
+            if not client.cooldown_seconds:
+                now_ms=int(time.time()*1000)
+                for symbol,start,end in execution_paper.funding_jobs(db,now_ms):
+                    db.execute("UPDATE executable_paper SET funding_requested_at=? WHERE symbol=? AND state IN ('OPEN','AWAITING_FUNDING')",(now_ms,symbol));db.commit()
+                    events=await client.get('/fapi/v1/fundingRate',symbol=symbol,startTime=start,endTime=end,limit=1000)
+                    complete=execution_paper.apply_funding(db,symbol,start,end,events,int(time.time()*1000))
+                    status['funding_last_success']=utc_now() if complete else status.get('funding_last_success')
+                    status['funding_last_error']=None if complete else 'Funding yanıtı eksik veya geçersiz; net sonuç bekletiliyor'
+                    _drift_cache.clear();_quality_cache.clear()
+        except Exception as exc:
+            status['funding_last_error']=str(exc)[:180]
+            log.warning('Funding coverage postponed: %s',str(exc)[:180])
+        await asyncio.sleep(15)
+
+
+async def quality_worker():
+    while True:
+        try:quality_report.snapshot(db,int(time.time()*1000))
+        except Exception as exc:log.warning('Daily quality snapshot failed: %s',str(exc)[:160])
+        await asyncio.sleep(300)
+
+
+def _professional_report(now_ms):
+    cached=_quality_cache.get('report')
+    if cached and 0<=now_ms-cached[0]<20000:return cached[1]
+    value=quality_report.report(db,now_ms)
+    eligible=[]
+    for symbol in signals:
+        pred=_active_prediction(symbol,now_ms)
+        if not pred:continue
+        combined=combined_assessment(pred)
+        if combined.get('direction') in ('LONG','SHORT') and combined.get('status') in ('İŞLEM SİNYALİ','TAKİP ET'):
+            eligible.append((symbol,combined['direction'],combined.get('score',0)))
+    eligible.sort(key=lambda r:-r[2]);eligible=eligible[:60]
+    histories={s:contiguous_recent(db,s,needed=80,limit=100) for s,_,_ in eligible}
+    value['risk_groups']=correlation_groups(histories,{s:side for s,side,_ in eligible})
+    value['models']=coin_engine.stats(universe)
+    value['funding']={'last_success':status.get('funding_last_success'),'last_error':status.get('funding_last_error'),
+        'pending_results':db.execute("SELECT COUNT(*) FROM executable_paper WHERE shadow=0 AND state='AWAITING_FUNDING'").fetchone()[0]}
+    value['policy']=PROFESSIONAL_POLICY
+    value['release']='V7.2'
+    _quality_cache['report']=(now_ms,value);return value
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _load_snapshot()
@@ -642,7 +732,9 @@ async def lifespan(app: FastAPI):
              asyncio.create_task(kline_worker(_live_symbols, _on_kline_close, _kline_state)),
              asyncio.create_task(history_warm_worker()),
              asyncio.create_task(stream_signal_worker()),
-             asyncio.create_task(paper_settlement_worker())]
+             asyncio.create_task(paper_settlement_worker()),
+             asyncio.create_task(funding_worker()),
+             asyncio.create_task(quality_worker())]
     if ENABLE_REST_SCANNER:
         tasks.append(asyncio.create_task(scan_worker()))
     try:
@@ -693,7 +785,7 @@ def _execution_monitor(now_ms):
         audit=pred.get('execution_quality') or {}
         if pred.get('signal') in ('LONG','SHORT') and audit.get('approved'):approved+=1
         counts.update(set(audit.get('reasons') or []))
-    return {'policy_version':'V7.1','book_stream':status.get('book_source','Bekleniyor'),
+    return {'policy_version':'V7.2','book_stream':status.get('book_source','Bekleniyor'),
             'fresh_books':fresh_books,'total_symbols':len(universe),'active_candidates':candidates,
             'entry_passed':approved,'veto_reasons':[{'reason':r,'count':n} for r,n in counts.most_common(8)],
             'notice':'Anlık giriş kontrolü; sebepler aynı adayda birlikte bulunabilir. Üst kademe verisi tüm derinliği veya emir gerçekleşmesini kanıtlamaz.'}
@@ -704,12 +796,17 @@ async def execution_monitor():
     return _execution_monitor(int(time.time()*1000))
 
 
+@app.get('/api/professional-report')
+async def professional_report():
+    return _professional_report(int(time.time()*1000))
+
+
 @app.get("/api/health")
 async def health():
     now = time.time()
     fresh = status["tickers_updated"] is not None and now - status["tickers_updated"] < 120
     return {"provider": "Binance USDⓈ-M Futures (WebSocket tickers + REST candles + official archive)", "provider_ok": fresh,
-            "model_ready": coin_engine.stats(universe)["ensemble_trained"] > 0,
+            "model_ready": coin_engine.stats(universe)["professional_trained"] > 0,
             "model_training": status["model_training"],
             "training_stage": status["training_stage"], "last_error": status["last_error"],
             "coin_training": {**coin_engine.stats(universe), "enabled": COIN_AUTO_TRAIN,
@@ -757,7 +854,7 @@ async def health():
                                     and p.get("model_version")==coin_engine.version(symbol)
                                     and int(time.time()*1000)-p.get("candle_time",0)<45*60*1000)},
             "technical_feature_count":len(__import__('ml_engine').COLS),
-            "unified_scoring_version":"V7.1",
+            "unified_scoring_version":"V7.2",
             "execution_monitor": _execution_monitor(int(now*1000)),
             "unified_counts": _unified_counts(now),
             "data_updated_at": datetime.fromtimestamp(status["tickers_updated"], tz=timezone.utc).isoformat() if status["tickers_updated"] else None}
@@ -896,7 +993,7 @@ async def opportunities(limit: int = Query(12, ge=1, le=50)):
                      'updated_at':pred.get('updated_at'),
                      'warning':'Birleşik puan TP kazanma olasılığı değildir; takip fırsatı işlem onayı değildir'})
     rows.sort(key=lambda x:(x['kind']=='İŞLEM SİNYALİ',x['unified']['score']),reverse=True)
-    return {'version':'V7.1','total':len(rows),'counts':counts,'rows':rows[:limit],
+    return {'version':'V7.2','total':len(rows),'counts':counts,'rows':rows[:limit],
             'notice':'AI + indikatör + formasyon + 1s/4s tek puan ve tek yön. TAKİP ET doğrulanmış işlem sinyali değildir. 0-100 puan TP başarı yüzdesi değildir.'}
 
 
@@ -908,14 +1005,14 @@ async def paper(limit: int = Query(100, ge=1, le=500)):
 
 @app.get("/api/model")
 async def model_info():
-    return {"ready": coin_engine.stats(universe)["ensemble_trained"]>0,
+    return {"ready": coin_engine.stats(universe)["professional_trained"]>0,
             "training":status["model_training"], "stage":status["training_stage"],
             "scope":"independent_model_per_symbol",
             "coin_training":coin_engine.stats(universe),
             "legacy_global_model":{"exists":engine.model is not None,
                                   "version":(engine.info or {}).get("version"),
                                   "used_for_live_signals":False},
-            "notice":"V7.1 ana sistem: Her coin ve yön için LogisticRegression, HistGradientBoosting ve ExtraTrees ağırlıklı oylaması. En az iki model, iki destekleyen oy, en az %60 destek ağırlığı ve en fazla 20 puan farkı gerekir. Ağırlık ve kalibrasyon yalnızca VALID verisinden; test verisiyle ayarlanmaz. Eski tek model kayıtları oylama eğitilene kadar sinyal üretmez. TP/SL yalnızca TRAIN verisinden seçilir; gerçek emir yok."}
+            "notice":"V7.2: Üç algoritmalı oy, en az 9.000 mum, 24s ayrılmış en az 12 sonuç, üç kronolojik dönem ve 1.400 yön testi için ihtiyatlı çoklu seçim taraması. Piyasa koşulu kanıtı ve canlı giriş denetimi gerekir. Aday model mevcut onaylı yönleri koruma şartıyla kabul edilir; farklı dönemlerin puanları sıralanmaz. Alış/satış + ücret/kayma varsayımı + gerçekleşmiş funding ile sanal takip; gerçek emir yok."}
 
 
 @app.post("/api/admin/retrain")
@@ -926,6 +1023,21 @@ async def retrain(x_admin_token: str | None = Header(default=None)):
     return {"message": "563 coin icin sirali yeni egitim turu istendi; 7/24 gorev sonraki turda uygulayacak"}
 
 
+@app.post('/api/admin/rollback/{symbol}')
+async def rollback(symbol:str,version:str,x_admin_token:str|None=Header(default=None)):
+    if not ADMIN_TOKEN or x_admin_token!=ADMIN_TOKEN:
+        raise HTTPException(status_code=403,detail='Yönetici anahtarı zorunlu')
+    symbol=symbol.upper()
+    if symbol not in universe:raise HTTPException(status_code=404,detail='Desteklenmeyen sözleşme')
+    if status.get('coin_training_current')==symbol:
+        raise HTTPException(status_code=409,detail='Bu coinin eğitimi devam ediyor; sürüm değişimi bekletildi')
+    try:info=coin_engine.restore_version(symbol,version)
+    except (ValueError,OSError,KeyError) as exc:raise HTTPException(status_code=400,detail=str(exc)[:180]) from exc
+    signals.pop(symbol,None);_drift_cache.clear();_quality_cache.clear()
+    enqueue_inference(symbol,'Doğrulanmış arşiv sürümüne geri dönüş')
+    return {'symbol':symbol,'active_version':info['version'],'notice':'Giriş, piyasa koşulu ve canlı sonuç kilitleri yeniden uygulanır'}
+
+
 @app.get("/api/coin-model/{symbol}")
 async def coin_model_detail(symbol: str):
     symbol = symbol.upper()
@@ -933,6 +1045,9 @@ async def coin_model_detail(symbol: str):
         raise HTTPException(status_code=404,detail="Desteklenmeyen Futures sozlesmesi")
     return {"symbol":symbol, "trained":coin_engine.ready(symbol),
             "ensemble_ready":coin_engine.ensemble_ready(symbol),
+            "professional_ready":coin_engine.professional_ready(symbol),
+            "latest_candidate":coin_engine.challengers.get(symbol),
+            "versions":coin_engine.version_history(symbol),
             "info":coin_engine.info(symbol), "directional_signal_permissions":coin_engine.permissions(symbol),
             "notice":"Tek basina egitim basarili sinyal veya kar garantisi degildir."}
 
@@ -947,6 +1062,8 @@ async def coin_model_list(limit: int = Query(100, ge=1, le=1000)):
             models.append({"symbol":sym,"version":info["version"], "trained_at":info["trained_at"],
                           "approved_long":p["LONG"]["approved"], "approved_short":p["SHORT"]["approved"],
                           "ensemble_ready":coin_engine.ensemble_ready(sym),
+                          "professional_ready":coin_engine.professional_ready(sym),
+                          "history_count":info.get('historical_candles_used'),
                           "test_samples":info.get("test_samples")})
     return {"stats":coin_engine.stats(universe),"models":models[:limit],"total_models":len(models)}
 

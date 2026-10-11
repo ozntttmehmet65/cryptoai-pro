@@ -109,6 +109,10 @@ def model_permissions(info: dict | None) -> dict:
             ok = bool(ok and info['ensemble_policy'] == 'weighted_soft_vote_consensus_v71'
                       and (d or {}).get('ensemble_policy') == info['ensemble_policy']
                       and (d or {}).get('ensemble_member_count',0) >= 2)
+        if (info or {}).get('professional_policy'):
+            audit=(d or {}).get('professional_audit') or {}
+            ok=bool(ok and info['professional_policy']=='professional_v72'
+                and audit.get('policy')==info['professional_policy'] and audit.get('passed') is True)
         result[direction] = {
             "approved": ok,
             "reason": ("Kronolojik test doğrulaması mevcut" if ok else
@@ -124,6 +128,8 @@ def live_drift_block(db, direction: str, now_ms: int, symbol=None, model_version
            WHERE state='CLOSED' AND settlement_method='tp_sl_live_quote_v1'
              AND signal=? AND result_at>=?"""
     params=[direction,now_ms-6*3600*1000]
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='executable_paper'").fetchone():
+        query="SELECT net_return FROM executable_paper WHERE state='CLOSED' AND shadow=0 AND signal=? AND result_at>=?"
     if symbol is not None:
         query+=' AND symbol=?';params.append(symbol)
     if model_version is not None:

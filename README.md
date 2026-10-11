@@ -1,46 +1,41 @@
-# CryptoAI Pro V7.1
+# CryptoAI Pro V7.2
 
-Read-only Binance futures analysis and forward paper observations. No exchange orders are sent.
+Read-only Binance USD-M futures analysis and forward paper observations. No exchange order is sent. Docker builds the readable `source/` tree; the existing `/app/data` disk, SQLite database and `coin_models_v60` paths are preserved.
 
-The former Dockerfile embedded an XZ application archive. The identical application was extracted into `source/`; Docker now builds directly from readable source. Existing `/app/data`, `signals.sqlite`, and `coin_models_v60` paths and model evaluation families are preserved.
+## Professional main-system policy
 
-V6.2 adds one shared entry veto for the market list, detail page, opportunities, health counts, and REST/WebSocket paper entry. Quotes must be under 10 seconds old, entries within 15 minutes of candle close, reference movement no more than 0.35 ATR, and theoretical TP distance greater than the existing 0.16% assumed round-trip cost. Current model permission and live direction drift checks remain mandatory. These are operational filters, not a newly backtested strategy or a claimed increase in win rate. Model scores and confirmation points are not guaranteed TP probabilities.
+Each coin and direction trains LogisticRegression, HistGradientBoosting and bounded 48-tree ExtraTrees members. At least two members are mandatory; there is no single-model fallback. Inverse validation-Brier weights and aggregate shrink calibration use validation only. A frozen consensus requires two calibrated member scores >=0.60, their weight >=0.60 and maximum score spread <=0.20. Directional score >=0.65 and opposite-direction gap >=0.10 remain mandatory.
 
-The paper page reports separate LONG/SHORT results, Wilson lower bounds, sample size, data gaps and theoretical profit factor. Shadow, legacy, unresolved and unverified observations are never counted as successful closed approved signals. Open and unverified totals remain visible. Wilson intervals assume independent samples; correlated coins can violate that assumption. Paper observations omit real executions, variable spread, funding and liquidation.
+V7.2 adds nine controls:
 
-## Verify locally
+1. **Longer real history and fixed time periods.** Target 18,000 genuine consecutive 15-minute candles, minimum 9,000 for direction approval. Older history uses bounded, paced REST pages, checkpointed after each success; migration continues sequentially. New listings receive no fabricated bars. Existing chronological train/validation/test splits purge the 24-hour label overlap. One frozen candidate is tested over three chronological thirds of its untouched holdout; these are not separately fitted rolling models.
+2. **Bid/ask forward paper and costs.** New LONG entries use ask, SHORT entries bid; exits use the opposite side. Observed spread is embedded in prices. Explicit assumptions: 0.06% fee and 0.02% adverse slippage per leg on a hypothetical 100-unit quote notional. TP exits cap favourable overshoot. Missing exit size or a book gap over three minutes becomes unverified. Positions have no timer expiry. Published historical funding events and their mark prices are accounted for across entry < event <= exit. Net return remains absent until the entire interval has certified funding coverage. Neither fills, account fees, leverage nor liquidation are measured.
+3. **Persistent quality reports.** Istanbul calendar-day decision counts, veto reasons, regimes, TP/SL, funding-pending exits, mean closed net return and negative-result sequences. Coin/candle/version identities prevent duplicate decisions. Snapshots refresh every five minutes, including the previous six completed days to incorporate delayed funding; decisions retain 14 days and daily snapshots 90 days. Earlier snapshots remain dated measurements.
+4. **Causal regime filter.** Fixed rules from already closed ATR, volatility, ADX and 4-hour trend classify uptrend/downtrend/range/extreme. Extreme regimes veto entries. Other regimes need at least four independent holdout resolutions and positive stressed mean; they still need all direction and execution gates.
+5. **Exposure correlation groups.** At most 60 current approved/follow candidates are compared on matched recent closed-candle returns, with >=64 common returns and exposure correlation >=0.85. SHORT exposure reverses return signs. Missing timestamps are never filled. Connected groups expose related opportunities; they do not send orders or approve signals.
+6. **Controlled model promotion and rollback.** Each candidate and prior active artifact are archived. A current approved professional incumbent remains active if a challenger fails any currently approved direction. Metrics from different test periods are not ranked as if directly comparable. Four recent versions plus the incumbent are retained. Token-protected rollback accepts only a matching professional artifact with current (<24-hour), approved evidence; its original date stays intact and normal entry/drift gates still apply.
+7. **Multiple-selection screen.** At least 12 resolved candidates selected >=24 hours apart before outcomes are inspected, >=85% resolution, positive stressed mean and three positive time periods are required. Exact one-sided binomial tail is adjusted for a fixed 1,400 directional tests per cycle, alongside a family-adjusted Wilson lower bound against worst sampled stressed break-even. Binomial/Wilson calculations assume independence; spacing does not prove independence. This is not an error guarantee across repeated retraining cycles or proof of market profitability.
+8. **Causality regression check.** Future price/volume mutations must leave earlier 58 features and regime classifications unchanged. Training rejects gapped, unsorted or invalid OHLC histories; inference rejects stale feature rows and incompatible artifact/policy versions.
+9. **Forward calibration diagnostics.** Only new approved observations with observable TP/SL within 24 hours enter reliability bins, Brier and ECE. Late exits, mature unresolved windows, unknown data and shadow observations are reported separately. These are descriptive measurements and never automatically retune thresholds. Scores remain conditional on a TP/SL resolution within 24 hours; LONG and SHORT scores need not sum to one.
+
+Older V7.1 voting artifacts are visible for audit but cannot approve a V7.2 direction until professional migration finishes. Training a model does not mean its direction passed. Failed or unapproved candidates never bypass the gates. Old last-trade paper results are stored and reported separately; they cannot establish V7.2 bid/ask performance.
+
+## Shared execution veto
+
+All market, detail, opportunity and paper-entry paths require current direction permission, fresh last quote (<10s), fresh bid/ask (<12s), entry within 15 minutes of candle close, displacement <=0.35 ATR, spread <=8bps and <=0.10 ATR, and >=1,000 quote units displayed on each best level. Stressed cost is 0.4% plus observed spread, with a five-point conditional-score margin. Global and symbol/model-specific forward drift vetoes use new approved observations. Consensus, regime, evidence and execution checks only veto; none can promote an otherwise unapproved model.
+
+## Run and verify
 
 ```sh
 python -m pip install -r source/requirements.txt
-python -m unittest discover -s tests -v
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 python -m unittest discover -s tests -v
 node --check source/static/app.js
-```
-
-## Run
-
-```sh
 cd source
 DATA_DIR=/path/to/persistent/data uvicorn app:app --host 0.0.0.0 --port 10000 --workers 1
 ```
 
-The existing Render Docker service can deploy this repository without a new service or disk. Keep its existing persistent disk mount and environment variables. No production profit benchmark has been performed for the added entry veto; validate via forward observation before interpreting results as predictive improvement.
+Docker defaults `PRO_TRAIN_CANDLES=18000` (clamped to 9,000–18,000); older `TRAIN_CANDLES` does not reduce the professional minimum. Keep the existing Render service and persistent disk. No new service, paid model API, exchange credentials or resource plan is required.
 
-## V7.0 execution policy and frozen diagnostics
+Public audit endpoints include `/api/professional-report`, `/api/coin-models`, `/api/coin-model/{symbol}`, `/api/paper` and `/api/execution-monitor`. Rollback is `POST /api/admin/rollback/{symbol}?version=...` with the existing `X-Admin-Token`; absent/incorrect tokens reject access.
 
-Adds a single public USD-M all-book-ticker WebSocket. Exchange event timestamps and book update IDs reject replayed/out-of-order records. All views and forward paper entry require a fresh best bid/ask (12s), spread <=8bps and <=0.10 ATR, and at least 1,000 USDT visible on EACH best level. These are predeclared conservative policy limits, not empirically optimized profit rules. Full depth, actual fills, order size, funding and liquidation are not measured.
-
-A conditional TP-score check compares the calibrated score with the 0.4% stressed round-trip assumption plus observed spread and a five-percentage-point margin. The underlying score is conditional on resolution inside 24 hours, not an unconditional real-world expected return. The shared gate can only veto; it cannot override model validation. Global direction and symbol/model-specific forward drift locks both apply. Quotes can recover an eligible entry inside its original window, without duplicating an approved observation. Shadow tracks have separate identities and cannot block an approved track. Entry-policy cohorts distinguish V7.0 observations from older results.
-
-New sequential model training additionally saves non-overlapping 24h candidate diagnostics, three frozen chronological test segments, reliability bins and calibration ECE. Unresolved independent candidates remain in the denominator; segments and bins are diagnostic and NEVER select parameters. In V7.0 existing models remained usable under their original validation; V7.1 requires migration to voting. New artifacts contain a version/family identifier checked against metadata; inference rejects an older feature row masquerading as the latest candle.
-
-18 regression tests plus a synthetic training/reload/inference integration check and eight local HTTP endpoints were verified. Synthetic fixtures are test data only and never production market evidence. No forward improvement claim is made; V7.0 needs new observations.
-
-## V7.1 main-system weighted voting
-
-Each coin and direction now trains LogisticRegression, HistGradientBoosting and a bounded 48-tree ExtraTrees classifier. All successfully trained members participate; at least two are required, with no single-model fallback. Fixed inverse validation-Brier weights (floor 0.05) and aggregate shrink calibration use validation data only. Holdout is never used to choose weights, thresholds or calibration.
-
-The frozen live AND holdout consensus policy requires at least two calibrated member scores >=0.60, their combined weight >=0.60 and maximum member-score spread <=0.20. The existing 0.65 directional decision and 0.10 opposite-direction gap remain. Probabilities remain visible for audit when consensus vetoes an entry. Validation, entry, liquidity and drift gates can only veto. New observation cohorts use V7.1; old results do not establish voting performance.
-
-On upgrade, old model records cannot supply live single-model predictions and are replaced as each voting ensemble trains; historical paper records remain. Sequential migration starts immediately regardless of old training age, prioritizes unconverted coins and exposes ensemble_trained / ensemble_pending counts. A failed refresh retains a previously valid ensemble; insufficient history remains pending. Runtime and dependencies stay on one CPU; no chat-model APIs or trading credentials added.
-
-V7.1 verification: 24 regression tests passed, including weighted vote arithmetic, consensus veto despite a high average, two-supporter requirement, malformed/single-member rejection, immediate legacy migration and policy mismatch rejection. A separate synthetic 3,000-bar integration fit both three-member heads, saved/reloaded them and inferred the current candle with finite JSON. Fixtures never become live market evidence.
+Verification includes synthetic 9,000-candle three-member training/reload, candidate rejection without incumbent replacement, artifact restoration, future-mutation checks, bid/ask/funding calculations, incomplete funding, missing book size, replay/gap handling, shadow separation, calendar midnight and late funding reports, interrupted history checkpoints and shared API gates. Synthetic fixtures are isolated test data, never production market evidence. Forward results must accumulate after deployment; no profit improvement has been established.

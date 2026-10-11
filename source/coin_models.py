@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import time
+import shutil
 
 import joblib
 import numpy as np
@@ -31,6 +32,7 @@ from holdout_audit import audit as holdout_audit
 from technical_analysis import setup_arrays, technical_scan
 from risk_plan import choose_on_train, entry_guidance, FALLBACK, ASSUMED_STRESS_COST
 from symbol_utils import symbol_valid, symbol_file_key
+from professional import POLICY as PROFESSIONAL_POLICY, HISTORY_TARGET, professional_audit, market_condition, market_regimes
 
 LOG = logging.getLogger(__name__)
 MODEL_FAMILY = "tp-sl-adaptive-brackets-per-symbol-v60"
@@ -60,6 +62,7 @@ class CoinModelRegistry:
         self.max_in_memory = max(1, int(max_in_memory))
         self.metadata = {}
         self.cache = OrderedDict()
+        self.challengers = {}
         for path in self.directory.glob("*.json"):
             try:
                 v = json.loads(path.read_text(encoding="utf-8"))
@@ -89,6 +92,39 @@ class CoinModelRegistry:
     def version(self, symbol):
         return (self.info(symbol) or {}).get("version")
 
+    def version_history(self,symbol):
+        directory=self.directory/'versions'/symbol_file_key(symbol)
+        result=[]
+        for path in sorted(directory.glob('*.json'),key=lambda p:p.stat().st_mtime,reverse=True)[:6]:
+            try:
+                info=json.loads(path.read_text(encoding='utf-8'))
+                result.append({'version':info['version'],'trained_at':info['trained_at'],
+                    'active':info['version']==self.version(symbol),'promotion':info.get('promotion'),
+                    'professional_policy':info.get('professional_policy'),
+                    'approved_directions':[s for s,p in model_permissions(info).items() if p['approved']]})
+            except (OSError,ValueError,KeyError):continue
+        return result
+
+    def restore_version(self,symbol,version):
+        if not isinstance(version,str) or len(version)>180 or any(not (c.isalnum() or c in '-_') for c in version):
+            raise ValueError('Invalid version identifier')
+        directory=self.directory/'versions'/symbol_file_key(symbol)
+        info=json.loads((directory/f'{version}.json').read_text(encoding='utf-8'))
+        payload=joblib.load(directory/f'{version}.joblib')
+        if (info.get('symbol')!=symbol or info.get('version')!=version or info.get('professional_policy')!=PROFESSIONAL_POLICY
+            or payload.get('version')!=version or payload.get('professional_policy')!=PROFESSIONAL_POLICY
+            or payload.get('model_family')!=MODEL_FAMILY or payload.get('ensemble_policy')!=ENSEMBLE_POLICY
+            or not 0<=time.time()-_time_of(info.get('trained_at'))<=24*3600
+            or not any(p['approved'] for p in model_permissions(info).values())):
+            raise ValueError('Rollback requires a current, verified professional model')
+        tmp_model=self._artifact_path(symbol).with_suffix('.restore.joblib')
+        tmp_meta=self._meta_path(symbol).with_suffix('.restore.json')
+        shutil.copy2(directory/f'{version}.joblib',tmp_model)
+        tmp_meta.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+        os.replace(tmp_model,self._artifact_path(symbol));os.replace(tmp_meta,self._meta_path(symbol))
+        self.metadata[symbol]=info;self.cache.pop(symbol,None)
+        return info
+
     def ready(self, symbol):
         return symbol in self.metadata and self._artifact_path(symbol).exists()
 
@@ -97,18 +133,25 @@ class CoinModelRegistry:
         if not self.ensemble_ready(symbol):
             for side in result.values():
                 side.update(approved=False, reason="Çoklu model eğitimi bekleniyor; eski tek model ana sinyal üretmez")
+        info=self.info(symbol) or {}
+        if info.get('professional_policy')!=PROFESSIONAL_POLICY or not 0<=time.time()-_time_of(info.get('trained_at'))<=24*3600:
+            for side in result.values():
+                side.update(approved=False, reason="Profesyonel dönem / çoklu seçim testi veya güncel model kanıtı bekleniyor")
         return result
 
     def ensemble_ready(self, symbol):
         return bool(self.ready(symbol) and
                     (self.info(symbol) or {}).get("ensemble_policy") == ENSEMBLE_POLICY)
 
+    def professional_ready(self, symbol):
+        return bool(self.ensemble_ready(symbol) and (self.info(symbol) or {}).get('professional_policy')==PROFESSIONAL_POLICY)
+
     def training_due(self, symbol, now=None, interval_hours=6, retry_seconds=3600):
         now = now or time.time()
         info = self.info(symbol)
         if info is None:
             return True
-        if not self.ensemble_ready(symbol):
+        if not self.professional_ready(symbol):
             return True  # Migrate immediately, even if the old model is recent.
         # Last successful per-symbol training, not the global model's time.
         trained = _time_of(info.get("trained_at"))
@@ -123,6 +166,9 @@ class CoinModelRegistry:
                 "ensemble_trained": sum(self.ensemble_ready(s) for s in trained),
                 "ensemble_pending": sum(not self.ensemble_ready(s) for s in pool),
                 "ensemble_policy": ENSEMBLE_POLICY,
+                "professional_trained":sum(self.professional_ready(s) for s in trained),
+                "professional_pending":sum(not self.professional_ready(s) for s in pool),
+                "history_target":HISTORY_TARGET,
                 "pending": max(0, len(pool)-len(trained)),
                 "approved_long": approved_long, "approved_short": approved_short,
                 "both_directions_blocked": sum(not (self.permissions(s)["LONG"]["approved"] or self.permissions(s)["SHORT"]["approved"]) for s in trained)}
@@ -231,6 +277,15 @@ class CoinModelRegistry:
     def fit(self, symbol, candles):
         if not symbol_valid(symbol):
             raise ValueError("Invalid symbol")
+        stamps=[int(c['time']) for c in candles]
+        if any(b-a!=INTERVAL_MS for a,b in zip(stamps,stamps[1:])):
+            raise ValueError('Training candles must be consecutive, unique and chronological')
+        for c in candles:
+            values=[float(c[k]) for k in ('open','high','low','close','volume')]
+            o,h,l,cl,v=values
+            if (not np.isfinite(values).all() or min(o,h,l,cl)<=0 or v<0
+                or l>min(o,cl) or h<max(o,cl) or int(c['close_time'])!=int(c['time'])+INTERVAL_MS-1):
+                raise ValueError('Invalid OHLC candle geometry or close time')
         # Construct causal feature rows independently of any candidate bracket.
         # The V5.9 training=True helper dropped ambiguous fixed-2.5/1.5 labels;
         # reusing it would unfairly bias an optimized V6 bracket selection.
@@ -352,6 +407,7 @@ class CoinModelRegistry:
         outcomes = test[["long_outcome","short_outcome"]].to_numpy(dtype=int)
         atrs = test["atr_pct"].to_numpy(dtype=float)
         test_times = test["time"].to_numpy(dtype=np.int64)
+        test_regimes=market_regimes(test)
         validation = {
             "LONG": tp_sl_direction_metrics(actions, outcomes[:,0], atrs, test_times, 1,
                tp_atr=risk_plan['LONG']['tp_atr'], sl_atr=risk_plan['LONG']['sl_atr']),
@@ -381,6 +437,9 @@ class CoinModelRegistry:
             validation[direction]["model_choice"] = detail.get("chosen")
             validation[direction]["ensemble_policy"] = ENSEMBLE_POLICY
             validation[direction]["ensemble_member_count"] = detail.get("member_count",0)
+            validation[direction]['professional_audit']=professional_audit(actions,
+                outcomes[:,0 if sign==1 else 1],atrs,test_times,sign,
+                br['tp_atr'],br['sl_atr'],test_regimes,len(candles))
             # Overlapping 24h first-touch labels are correlated: effective
             # independent evidence is smaller than raw 15m signal count.
             independent = 0
@@ -442,11 +501,14 @@ class CoinModelRegistry:
                 "test_method":"fixed_score>=6.5; purged chronological unseen TP/SL first touch (24h censored)",
                 "notice":"Exploratory technical confirmation; historical correlation and multiple-comparison risk. Not guaranteed live P(TP)."}
         date = datetime.now(timezone.utc)
-        version = date.strftime("coin-%Y%m%dT%H%M%SZ") + "-" + symbol + "-v71"
+        version = date.strftime("coin-%Y%m%dT%H%M%S%fZ") + "-" + symbol + "-v72"
         info = {
             "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":2,
             "algorithm":"Per-direction LogisticRegression + HistGradientBoosting + ExtraTrees weighted soft voting, validation-only calibration and fixed consensus veto",
             "ensemble_policy": ENSEMBLE_POLICY,
+            "professional_policy":PROFESSIONAL_POLICY,
+            "historical_candles_used":len(candles),
+            "test_period_start":int(test_times[0]),"test_period_end":int(test_times[-1]),
             "consensus_policy": {"max_score_spread":MAX_VOTE_SPREAD,
                 "min_support_weight":MIN_VOTE_SUPPORT, "member_score_threshold":MEMBER_SUPPORT_THRESHOLD,
                 "min_supporters":2, "minimum_members":2, "threshold_source":"predeclared_not_holdout_tuned"},
@@ -464,8 +526,8 @@ class CoinModelRegistry:
             "trade_exit_method":"TP_SL_FIRST_TOUCH_NO_TIME_LIMIT",
             "label_evaluation_lookahead_bars":EVALUATION_BARS,
             "probability_definition":"Conservatively shrunk ML score for P(TP first | either TP/SL observed within 24h), NOT a verified live success probability",
-            "historical_candle_target":4500,
-            "risk_note":"Finite 24h training labels are right-censored; live paper positions NEVER expire on a timer. Each direction has independent conditional probability, so p_long+p_short need not equal 1. 0.16% standard and 0.4% stressed total costs are assumptions; funding/liquidation/liquidity/real fills excluded.",
+            "historical_candle_target":HISTORY_TARGET,
+            "risk_note":"Finite 24h training labels are right-censored; live paper positions NEVER expire on a timer. Each direction has independent conditional probability, so p_long+p_short need not equal 1. Historical candle tests assume 0.16% standard / 0.4% stressed total costs and exclude funding and real fills. V7.2 forward paper separately observes bid/ask and settled funding; its fee/slippage remain assumptions, without liquidation or real executions.",
         }
         artifact = self._artifact_path(symbol)
         meta_path = self._meta_path(symbol)
@@ -473,7 +535,37 @@ class CoinModelRegistry:
         tmp_model = self.directory / f".{file_key}.tmp.joblib"
         tmp_info = self.directory / f".{file_key}.tmp.json"
         payload={"models":models,"calibration":calibrations,"version":version,"model_family":MODEL_FAMILY,
-                 "ensemble_policy":ENSEMBLE_POLICY}
+                 "ensemble_policy":ENSEMBLE_POLICY,"professional_policy":PROFESSIONAL_POLICY}
+        # Keep the candidate and previous champion as independent version files.
+        # Promotion preserves every currently approved incumbent direction unless
+        # the candidate also passes that direction. Comparing scores from different
+        # time windows would be misleading; this policy compares gate outcomes.
+        versions=self.directory/'versions'/file_key
+        versions.mkdir(parents=True,exist_ok=True)
+        previous=self.info(symbol)
+        previous_permissions=self.permissions(symbol)
+        candidate_permissions=model_permissions(info)
+        keep=bool(previous and self.professional_ready(symbol) and
+            any(p['approved'] for p in previous_permissions.values()) and
+            any(p['approved'] and not candidate_permissions[side]['approved']
+                for side,p in previous_permissions.items()))
+        info['promotion']={'accepted':not keep,'policy':'preserve_current_approved_directions_v72',
+            'previous_version':previous.get('version') if previous else None,
+            'comparison':'predeclared_validation_gates; different-period scores not ranked',
+            'reason':'Mevcut onaylı yön korunuyor; aday şartları geçmedi' if keep else 'Güncel aday kabul edildi; yön izinleri ayrıca denetlenir'}
+        joblib.dump(payload,versions/f'{version}.joblib',compress=2)
+        (versions/f'{version}.json').write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding='utf-8')
+        if previous and self._artifact_path(symbol).exists():
+            old_version=previous['version']
+            if not (versions/f'{old_version}.joblib').exists():
+                shutil.copy2(self._artifact_path(symbol),versions/f'{old_version}.joblib')
+                (versions/f'{old_version}.json').write_text(json.dumps(previous,ensure_ascii=False),encoding='utf-8')
+        # Bounded retention: latest four versions plus the active incumbent.
+        for old in sorted(versions.glob('*.json'),key=lambda p:p.stat().st_mtime,reverse=True)[4:]:
+            if previous and old.stem==previous['version']:continue
+            old.with_suffix('.joblib').unlink(missing_ok=True);old.unlink()
+        self.challengers[symbol]={'version':version,**info['promotion']}
+        if keep:return info
         joblib.dump(payload,tmp_model,compress=2)
         tmp_info.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding="utf-8")
         os.replace(tmp_model,artifact)
@@ -514,7 +606,7 @@ class CoinModelRegistry:
         models = self._load(symbol)
         if models is None or not isinstance(models,dict) or not isinstance(models.get("models"),dict):
             return None
-        if models.get("ensemble_policy") != ENSEMBLE_POLICY or models.get("version") != info.get("version"):
+        if models.get("ensemble_policy") != ENSEMBLE_POLICY or models.get("version") != info.get("version") or models.get('professional_policy')!=info.get('professional_policy'):
             return None
         now_ms = now_ms or int(time.time()*1000)
         closed = sorted((c for c in candles if c["close_time"] < now_ms),key=lambda c:c["time"])
@@ -528,6 +620,7 @@ class CoinModelRegistry:
             return None
         last = frame.iloc[-1]
         technical = technical_scan(frame)
+        condition=market_condition(frame)
         technical_direction = technical["direction"]
         risk_plan = info.get('risk_plan') or {}
         def _multipliers(side):
@@ -569,6 +662,8 @@ class CoinModelRegistry:
             reason='TP/SL seviyesi sifirin altinda; sinyal guvenlik kilidi'
             signal,confidence='BEKLE',0.0
         return {"signal":signal,"confidence":round(confidence,4) if signal!="BEKLE" else None,
+                "market_condition":condition,
+                "regime_evidence":((info.get('directional_validation') or {}).get(candidate) or {}).get('professional_audit',{}).get('regimes',{}).get(condition['name']),
                 "p_long":round(p_long,4),"p_short":round(p_short,4),
                 "ensemble":voting,
                 # LONG/SHORT scores are NOT a 3-class distribution.
