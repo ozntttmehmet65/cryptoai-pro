@@ -1,10 +1,10 @@
-# CryptoAI Pro V7.2
+# CryptoAI Pro V7.3
 
 Read-only Binance USD-M futures analysis and forward paper observations. No exchange order is sent. Docker builds the readable `source/` tree; the existing `/app/data` disk, SQLite database and `coin_models_v60` paths are preserved.
 
 ## Professional main-system policy
 
-Each coin and direction trains LogisticRegression, HistGradientBoosting and bounded 48-tree ExtraTrees members. At least two members are mandatory; there is no single-model fallback. Inverse validation-Brier weights and aggregate shrink calibration use validation only. A frozen consensus requires two calibrated member scores >=0.60, their weight >=0.60 and maximum score spread <=0.20. Directional score >=0.65 and opposite-direction gap >=0.10 remain mandatory.
+Each coin and direction trains LogisticRegression, HistGradientBoosting and bounded 48-tree ExtraTrees members. At least two members are mandatory; there is no single-model fallback. Inverse validation-Brier weights and aggregate shrink calibration use validation only. A frozen consensus requires two calibrated member scores >=0.60, their weight >=0.60 and maximum score spread <=0.20. Legacy directional score >=0.65 remains mandatory. V7.3 models use a candidate threshold chosen on chronological validation and frozen before holdout; the opposite-direction gap >=0.10 remains mandatory.
 
 V7.2 adds nine controls:
 
@@ -39,3 +39,41 @@ Docker defaults `PRO_TRAIN_CANDLES=18000` (clamped to 9,000–18,000); older `TR
 Public audit endpoints include `/api/professional-report`, `/api/coin-models`, `/api/coin-model/{symbol}`, `/api/paper` and `/api/execution-monitor`. Rollback is `POST /api/admin/rollback/{symbol}?version=...` with the existing `X-Admin-Token`; absent/incorrect tokens reject access.
 
 Verification includes synthetic 9,000-candle three-member training/reload, candidate rejection without incumbent replacement, artifact restoration, future-mutation checks, bid/ask/funding calculations, incomplete funding, missing book size, replay/gap handling, shadow separation, calendar midnight and late funding reports, interrupted history checkpoints and shared API gates. Synthetic fixtures are isolated test data, never production market evidence. Forward results must accumulate after deployment; no profit improvement has been established.
+
+
+## V7.3: explain zero approvals and repair candidate generation
+
+Production inspection on 2026-10-11 found 562 trained models, zero permitted
+LONG/SHORT directions and a still-running V7.2 migration. BTC and SOL had no
+holdout candidates; ETH LONG had five, below the existing 40-result floor.
+Several directions also failed validation or holdout baseline comparisons.
+Training success alone is not evidence that a direction should be approved.
+
+- Fix RSI when downside is zero: uninterrupted gains produce RSI 100 rather
+  than NaN (15m) or neutral RSI (1h/4h). Flat prices remain neutral.
+- Use 1200 consecutive, completed, fresh 15m bars for inference rather than
+  bootstrap histories of 110/120 bars. Reuse local training caches at startup;
+  copy the recent training segment into live storage after retrieval. Binance
+  pacing, cooldown and closed-bar validation remain unchanged. Recursive
+  indicators still have small initialization differences versus full training.
+- Choose one candidate threshold from the predeclared menu .55/.60/.65/.70/.75
+  using chronological validation only, including the existing consensus veto.
+  Freeze the result BEFORE computing holdout actions. Failed selection retains
+  .65 for observation and blocks new-model approval. The .10 direction margin,
+  member vote support, professional family screen, regime, stress and live
+  entry checks are retained. Validation selection can overfit; holdout gates do
+  not eliminate all statistical dependence or multiple-retraining risk.
+- Pair the frozen policy in schema-3 metadata and model payload, including
+  reload/restore checks. Legacy models retain their original candidate policy
+  and migrate sequentially. Preserve approved incumbents and version archives.
+- Add /api/signal-diagnostics, exact per-direction failed checks, actual versus
+  required values, and the model-screen explanation. Counts of failed checks
+  overlap; they are not separate models. /api/health identifies V7.3 and exposes
+  the same diagnostic view. Model list rows include the frozen candidate cut.
+
+Validation: 58 regression and integration tests passed, including the 47
+existing V7.2 tests. JavaScript syntax and whitespace checks passed. Ten local
+API endpoints were checked with a synthetic fit/reload/inference fixture.
+Synthetic tests establish implementation behavior, not market profitability.
+No TP improvement or nonzero approved signal count is promised. Production
+models retrain sequentially and may continue to abstain if their evidence fails.
