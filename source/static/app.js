@@ -225,6 +225,12 @@ async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
     let failureInfo = state.health?.coin_training?.pending_reasons||{};
     let issueText = pendingInfo.length?` Bekleyenler: ${pendingInfo.join(', ')}. ${Object.entries(failureInfo).map(([s,r])=>s+': '+r).join('; ')}`:'';
     setText('coinTrainingDetails',`7/24 sırayla eğitim · Coin başına ${state.health?.coin_training?.refresh_interval_hours||6} saat aralıklı yenileme. ${trained}/${total} coin eğitildi. Detaylar: /api/coin-models.${issueText}`);
+    const diag=state.health?.signal_diagnostics;
+    if(diag){
+      const reasons=Object.entries(diag.model_rejections||{}).flatMap(([side,rows])=>rows.slice(0,3).map(row=>`${side}: ${row.reason} (${row.count} model)`));
+      const stages=diag.stages||{};
+      setText('coinTrainingDetails',`${trained}/${total} model · Canlı hesaplama için ${diag.required_inference_bars} kapanmış mum. Veri bekleyen: ${stages.history_pending||0} · Eşik/yön teyidi bekleyen: ${stages.score_or_direction_margin||0} · Giriş onayı: ${stages.entry_approved||0}. ${reasons.join(' · ')}. Ret koşulları aynı modelde birlikte bulunabilir. Ayrıntı: /api/signal-diagnostics.${issueText}`);
+    }
     return;
   }
   let info=obj.info,mt=info?.metrics;
