@@ -20,7 +20,7 @@ from binance_client import BinanceClient, BinanceError, BinanceRateLimited
 from archive_client import ArchiveClient, last_complete_month
 from market_stream import ticker_worker, parse_books, BOOK_URL, merge_ordered
 from live_candles import (kline_worker, selected_symbols, setup as setup_live,
-                          store_bars, contiguous_recent, freshness_ok, seed_recent_rest)
+                          store_bars, contiguous_recent, freshness_ok, seed_recent_rest, history_ready)
 from paper_trade import setup as setup_paper, settle as settle_paper, reconcile_quotes, report as historical_paper_report
 import execution_paper
 import quality_report
@@ -29,7 +29,7 @@ from quality_guard import live_drift_block
 from execution_guard import guarded_prediction
 from ml_engine import ModelEngine
 from unified_scoring import combined_assessment
-from coin_models import CoinModelRegistry
+from coin_models import CoinModelRegistry, INFERENCE_HISTORY_BARS
 from symbol_utils import symbol_file_key
 from price_push import price_delta
 
@@ -300,11 +300,20 @@ async def history_warm_worker():
     from datetime import timedelta
     attempts = {}
     archive_attempts = {}
+    local_seeded = set()
     while True:
         symbols = _live_symbols()
         ready = 0
         for idx, symbol in enumerate(symbols):
-            candles = contiguous_recent(db, symbol, 80)
+            if symbol not in local_seeded:
+                local_seeded.add(symbol)
+                try:
+                    cached = json.loads((TRAINING_CACHE / (symbol_file_key(symbol) + '.json')).read_text(encoding='utf-8'))
+                    if cached.get('symbol') == symbol:
+                        store_bars(db, symbol, cached.get('candles', [])[-INFERENCE_HISTORY_BARS:])
+                except (OSError, ValueError, TypeError, KeyError):
+                    pass
+            candles = contiguous_recent(db, symbol, INFERENCE_HISTORY_BARS, limit=INFERENCE_HISTORY_BARS)
             if freshness_ok(candles):
                 ready += 1
                 # Make newly started service useful immediately from persisted
@@ -320,10 +329,10 @@ async def history_warm_worker():
                 attempts[symbol] = now
                 status["history_attempted"] += 1
                 try:
-                    inserted = await seed_recent_rest(client, db, symbol)
+                    inserted = await seed_recent_rest(client, db, symbol, limit=INFERENCE_HISTORY_BARS+1)
                     if inserted:
                         status["rest_bootstrap_count"] += 1
-                    if freshness_ok(contiguous_recent(db, symbol, 80)):
+                    if freshness_ok(contiguous_recent(db, symbol, INFERENCE_HISTORY_BARS, limit=INFERENCE_HISTORY_BARS)):
                         ready += 1
                         status["daily_history_ready"] = ready
                         enqueue_inference(symbol, "Binance REST tamamlanmış 15dk mumlar")
@@ -349,7 +358,7 @@ async def history_warm_worker():
                     except Exception as exc:
                         log.warning("Daily archive %s %s: %s", symbol,day,str(exc)[:100])
                     await asyncio.sleep(0.75)
-                if freshness_ok(contiguous_recent(db,symbol,80)):
+                if freshness_ok(contiguous_recent(db,symbol,INFERENCE_HISTORY_BARS,limit=INFERENCE_HISTORY_BARS)):
                     ready += 1
                     status["daily_history_ready"] = ready
                     enqueue_inference(symbol, "Binance resmî arşiv kapanmış 15dk mumlar")
@@ -357,7 +366,7 @@ async def history_warm_worker():
                 status["daily_history_ready"] = ready
             await asyncio.sleep(0.03)
         status["daily_history_ready"] = sum(1 for sym in symbols
-                if freshness_ok(contiguous_recent(db,sym,80)))
+                if freshness_ok(contiguous_recent(db,sym,INFERENCE_HISTORY_BARS,limit=INFERENCE_HISTORY_BARS)))
         await asyncio.sleep(180)
 
 
@@ -436,7 +445,7 @@ async def stream_signal_worker():
         try:
             if symbol not in universe or not coin_engine.ready(symbol):
                 continue
-            candles=contiguous_recent(db,symbol,80,limit=500)
+            candles=contiguous_recent(db,symbol,INFERENCE_HISTORY_BARS,limit=INFERENCE_HISTORY_BARS)
             if not freshness_ok(candles):continue
             result=coin_engine.infer(symbol,candles)
             if result is None:continue
@@ -563,7 +572,7 @@ async def scan_worker():
         symbol = order[pos]
         try:
             # Resolve older paper observations using only subsequent completed candles.
-            bars = await client.klines(symbol, limit=110)
+            bars = await client.klines(symbol, limit=INFERENCE_HISTORY_BARS+1)
             now_ms = int(time.time()*1000)
             settle_paper(db, symbol, bars, now_ms)
             inf = coin_engine.infer(symbol,bars)
@@ -620,6 +629,7 @@ async def coin_training_worker():
             status["training_stage"] = f"Profesyonel dönem ve oylama eğitimi: {symbol}"
             try:
                 bars = await _training_bars(symbol)
+                store_bars(db, symbol, bars[-INFERENCE_HISTORY_BARS:])
                 info = await asyncio.to_thread(coin_engine.fit, symbol, bars)
                 status["coin_training_success"] += 1
                 status["coin_training_last"] = {"symbol":symbol,"version":info["version"],
@@ -630,7 +640,7 @@ async def coin_training_worker():
                 status["coin_failure_reasons"].pop(symbol, None)
                 # Training is independent of the 15-minute inference queue;
                 # model is available immediately for the last CLOSED candle.
-                if freshness_ok(contiguous_recent(db,symbol,80)):
+                if freshness_ok(contiguous_recent(db,symbol,INFERENCE_HISTORY_BARS,limit=INFERENCE_HISTORY_BARS)):
                     enqueue_inference(symbol,"Coin modeli son egitim ve kapanmis 15dk")
                 log.info("Independent model trained %s %s, LONG=%s SHORT=%s", symbol,
                          info["version"], coin_engine.permissions(symbol)["LONG"]["approved"],
@@ -805,6 +815,46 @@ async def professional_report():
     return _professional_report(int(time.time()*1000))
 
 
+def _signal_diagnostics(now_ms):
+    from collections import Counter
+    failures = {side: Counter() for side in ('LONG', 'SHORT')}
+    labels = {}
+    stages = Counter()
+    for symbol in universe:
+        if not coin_engine.ready(symbol):
+            stages['model_pending'] += 1
+            continue
+        for side, permission in coin_engine.permissions(symbol).items():
+            for row in permission.get('checks', []):
+                if not row['passed']:
+                    failures[side][row['id']] += 1
+                    labels[row['id']] = row['label']
+        pred = signals.get(symbol)
+        if not pred or pred.get('model_version') != coin_engine.version(symbol):
+            stages['inference_pending' if history_ready(db, symbol, INFERENCE_HISTORY_BARS, now_ms) else 'history_pending'] += 1
+        elif not 0 <= now_ms-pred.get('candle_time', 0)-900000 < 900000:
+            stages['entry_window_expired'] += 1
+        elif pred.get('candidate_signal') not in ('LONG', 'SHORT'):
+            stages['score_or_direction_margin'] += 1
+        else:
+            stages['active_candidates'] += 1
+            active = _active_prediction(symbol, now_ms)
+            if active and active.get('signal') in ('LONG', 'SHORT'):
+                stages['entry_approved'] += 1
+    return {'as_of': now_ms, 'stages': dict(stages),
+            'required_inference_bars': INFERENCE_HISTORY_BARS,
+            'model_rejections': {side: [{'id': key, 'reason': labels[key], 'count': count}
+                                      for key, count in counter.most_common()]
+                                 for side, counter in failures.items()},
+            'threshold_policy': 'Coin başına doğrulamada seçilir; ayrı testten geçmeden işlem onayı verilmez',
+            'notice': 'Bir yön birden fazla şartta kalabilir; model sayısı onaylı sinyal sayısı değildir.'}
+
+
+@app.get('/api/signal-diagnostics')
+async def signal_diagnostics():
+    return _signal_diagnostics(int(time.time()*1000))
+
+
 @app.get("/api/health")
 async def health():
     now = time.time()
@@ -859,6 +909,8 @@ async def health():
                                     and int(time.time()*1000)-p.get("candle_time",0)<45*60*1000)},
             "technical_feature_count":len(__import__('ml_engine').COLS),
             "unified_scoring_version":"V7.2",
+            "signal_repair_version":"V7.3",
+            "signal_diagnostics": _signal_diagnostics(int(now*1000)),
             "execution_monitor": _execution_monitor(int(now*1000)),
             "unified_counts": _unified_counts(now),
             "data_updated_at": datetime.fromtimestamp(status["tickers_updated"], tz=timezone.utc).isoformat() if status["tickers_updated"] else None}
@@ -1016,7 +1068,7 @@ async def model_info():
             "legacy_global_model":{"exists":engine.model is not None,
                                   "version":(engine.info or {}).get("version"),
                                   "used_for_live_signals":False},
-            "notice":"V7.2: Üç algoritmalı oy, en az 9.000 mum, 24s ayrılmış en az 12 sonuç, üç kronolojik dönem ve 1.400 yön testi için ihtiyatlı çoklu seçim taraması. Piyasa koşulu kanıtı ve canlı giriş denetimi gerekir. Aday model mevcut onaylı yönleri koruma şartıyla kabul edilir; farklı dönemlerin puanları sıralanmaz. Alış/satış + ücret/kayma varsayımı + gerçekleşmiş funding ile sanal takip; gerçek emir yok."}
+            "notice":"V7.3: Üç algoritmalı oy, en az 9.000 mum, 24s ayrılmış en az 12 sonuç, üç kronolojik dönem ve 1.400 yön testi için ihtiyatlı çoklu seçim taraması. Piyasa koşulu kanıtı ve canlı giriş denetimi gerekir. Aday model mevcut onaylı yönleri koruma şartıyla kabul edilir; farklı dönemlerin puanları sıralanmaz. Alış/satış + ücret/kayma varsayımı + gerçekleşmiş funding ile sanal takip; gerçek emir yok."}
 
 
 @app.post("/api/admin/retrain")
@@ -1068,7 +1120,10 @@ async def coin_model_list(limit: int = Query(100, ge=1, le=1000)):
                           "ensemble_ready":coin_engine.ensemble_ready(sym),
                           "professional_ready":coin_engine.professional_ready(sym),
                           "history_count":info.get('historical_candles_used'),
-                          "test_samples":info.get("test_samples")})
+                          "test_samples":info.get("test_samples"),
+                          "long_failed_checks":p["LONG"].get("failed_checks", []),
+                          "short_failed_checks":p["SHORT"].get("failed_checks", []),
+                          "decision_threshold":(info.get("decision_policy") or {}).get("threshold", .65)})
     return {"stats":coin_engine.stats(universe),"models":models[:limit],"total_models":len(models)}
 
 

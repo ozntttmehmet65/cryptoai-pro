@@ -84,13 +84,13 @@ def store_bars(db,symbol,bars):
     return len(values)
 
 
-async def seed_recent_rest(rest_client, db, symbol):
+async def seed_recent_rest(rest_client, db, symbol, limit=120):
     """Bridge missing current-day candles with one paced 120-bar Binance REST read.
 
     BinanceClient owns all rate-limit/cooldown behavior. Only completed authentic
     candles persist; no current forming candles or synthetic candles are accepted.
     """
-    bars = await rest_client.klines(symbol, limit=120)
+    bars = await rest_client.klines(symbol, limit=limit)
     return store_bars(db, symbol, bars)
 
 
@@ -109,6 +109,15 @@ def freshness_ok(candles,now_ms=None,max_lag_ms=35*60*1000):
     if not candles:return False
     now_ms=int(time.time()*1000) if now_ms is None else now_ms
     return 0 <= now_ms-int(candles[-1]["close_time"]) <= max_lag_ms
+
+
+def history_ready(db, symbol, needed, now_ms):
+    """Read a small aggregate for status pages, without building candle arrays."""
+    count, first, last, close = db.execute('''SELECT COUNT(*),MIN(open_time),MAX(open_time),MAX(close_time)
+        FROM (SELECT open_time,close_time FROM completed_klines WHERE symbol=?
+              ORDER BY open_time DESC LIMIT ?)''', (symbol, needed)).fetchone()
+    return (count == needed and last-first == (needed-1)*INTERVAL_MS
+            and 0 <= now_ms-close <= 35*60*1000)
 
 
 def stream_groups(symbols, group_size=STREAMS_PER_SOCKET):

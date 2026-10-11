@@ -61,64 +61,94 @@ def tp_sl_direction_metrics(actions, outcomes, atr_percents, timestamps, directi
     }
 
 
+def _floor(value, minimum, strict=False):
+    try:
+        n = float(value)
+        return math.isfinite(n) and (n > minimum if strict else n >= minimum)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def validation_checks(validation):
+    d = validation if isinstance(validation, dict) else {}
+    limits = (
+        ('signals', 'Test aday sayısı', MIN_SIGNALS_PER_DIRECTION),
+        ('resolved', 'Sonuçlanan TP/SL sayısı', MIN_SIGNALS_PER_DIRECTION),
+        ('resolved_fraction', 'Sonuçlanma oranı', .85),
+        ('distinct_test_candles', 'Farklı test mumları', MIN_DISTINCT_TEST_CANDLES),
+        ('hit_rate', 'TP ilk temas oranı', MIN_WIN_RATE),
+        ('wilson_lower_95', 'Wilson alt sınırı', MIN_WILSON_LOWER),
+        ('mean_assumed_net_return', 'Masraf sonrası ortalama', MIN_MEAN_RETURN),
+    )
+    return [dict(id=key, label=label, actual=d.get(key), required=minimum,
+                 passed=_floor(d.get(key), minimum)) for key, label, minimum in limits]
+
+
 def approved(validation: dict | None) -> bool:
     """A training holdout is a prerequisite, not proof of future safety."""
-    if not isinstance(validation, dict):
-        return False
-    return (validation.get("signals", 0) >= MIN_SIGNALS_PER_DIRECTION
-            and validation.get("resolved", 0) >= MIN_SIGNALS_PER_DIRECTION
-            and validation.get("resolved_fraction", 0) >= 0.85
-            and validation.get("distinct_test_candles", 0) >= MIN_DISTINCT_TEST_CANDLES
-            and validation.get("hit_rate") is not None
-            and validation["hit_rate"] >= MIN_WIN_RATE
-            and validation.get("wilson_lower_95") is not None
-            and validation["wilson_lower_95"] >= MIN_WILSON_LOWER
-            and validation.get("mean_assumed_net_return") is not None
-            and validation["mean_assumed_net_return"] >= MIN_MEAN_RETURN)
+    return all(row['passed'] for row in validation_checks(validation))
 
 
 def model_permissions(info: dict | None) -> dict:
-    validation = (info or {}).get("directional_validation") or {}
-    method = (info or {}).get('evaluation_method')
-    method_ok = method in ('tp_sl_first_touch_24h_v1', 'tp_sl_first_touch_binary_ensemble_24h_v2', 'tp_sl_first_touch_binary_shrink_24h_v3', 'tp_sl_first_touch_pattern_mtf_24h_v4', 'tp_sl_first_touch_adaptive_bracket_24h_v5')
+    info = info or {}
+    validation = info.get('directional_validation') or {}
+    method = info.get('evaluation_method')
+    families = {
+        'tp_sl_first_touch_binary_ensemble_24h_v2': 'tp-sl-ensemble-per-symbol-v57',
+        'tp_sl_first_touch_binary_shrink_24h_v3': 'tp-sl-ensemble-shrunk-per-symbol-v58',
+        'tp_sl_first_touch_pattern_mtf_24h_v4': 'tp-sl-pattern-mtf-per-symbol-v59',
+        'tp_sl_first_touch_adaptive_bracket_24h_v5': 'tp-sl-adaptive-brackets-per-symbol-v60',
+    }
     result = {}
-    for direction in ("LONG", "SHORT"):
-        d = validation.get(direction)
-        ok = method_ok and approved(d)
-        if method in ('tp_sl_first_touch_binary_ensemble_24h_v2', 'tp_sl_first_touch_binary_shrink_24h_v3', 'tp_sl_first_touch_pattern_mtf_24h_v4', 'tp_sl_first_touch_adaptive_bracket_24h_v5'):
-            ok = bool(ok and (info or {}).get('model_family') == ('tp-sl-adaptive-brackets-per-symbol-v60' if method.endswith('_v5') else 'tp-sl-pattern-mtf-per-symbol-v59' if method.endswith('_v4') else 'tp-sl-ensemble-shrunk-per-symbol-v58' if method.endswith('_v3') else 'tp-sl-ensemble-per-symbol-v57')
-                      and d.get('validation_outperformed_baseline') is True
-                      and d.get('holdout_outperformed_baseline') is True
-                      and d.get('independent_signal_windows',0) >= 3
-                      and d.get('mean_stressed_net_return') is not None
-                      and d['mean_stressed_net_return'] > 0)
-            if method.endswith(('_v3','_v4','_v5')):
-                # Validation-only calibration must retain nontrivial learned
-                # signal; a constant past base rate is never an AI edge.
-                ok = bool(ok and d.get('calibration_alpha',0) >= .25
-                          and d.get('calibration_sample_count',0) >= 35)
+    for direction in ('LONG', 'SHORT'):
+        d = validation.get(direction) or {}
+        checks = validation_checks(d)
+        def check(key, label, actual, required, passed):
+            checks.append(dict(id=key, label=label, actual=actual, required=required, passed=bool(passed)))
+        check('evaluation_method', 'TP/SL test yöntemi', method, 'supported_first_touch',
+              method == 'tp_sl_first_touch_24h_v1' or method in families)
+        if method in families:
+            check('model_family', 'Model ailesi', info.get('model_family'), families[method], info.get('model_family') == families[method])
+            for key, label in (('validation_outperformed_baseline', 'Doğrulamada baz model üstünlüğü'),
+                               ('holdout_outperformed_baseline', 'Ayrı testte baz model üstünlüğü')):
+                check(key, label, d.get(key), True, d.get(key) is True)
+            check('independent_signal_windows', 'Bağımsız 24 saat pencereleri', d.get('independent_signal_windows'), 3, _floor(d.get('independent_signal_windows'), 3))
+            check('mean_stressed_net_return', 'Stres maliyeti sonrası ortalama', d.get('mean_stressed_net_return'), '>0', _floor(d.get('mean_stressed_net_return'), 0, strict=True))
+            if method.endswith(('_v3', '_v4', '_v5')):
+                check('calibration_alpha', 'Kalibrasyon öğrenilmiş sinyal payı', d.get('calibration_alpha'), .25, _floor(d.get('calibration_alpha'), .25))
+                check('calibration_sample_count', 'Kalibrasyon örnekleri', d.get('calibration_sample_count'), 35, _floor(d.get('calibration_sample_count'), 35))
         if method == 'tp_sl_first_touch_adaptive_bracket_24h_v5':
-            plan = ((info or {}).get('risk_plan') or {}).get(direction) or {}
-            tp,sl=plan.get('tp_atr'),plan.get('sl_atr')
-            try:
-                ok = bool(ok and 0 < float(tp) <= 6 and 0 < float(sl) <= 6
-                    and plan.get('chosen_on') in ('training_only_stressed_net','predeclared_fallback'))
-            except (ValueError,TypeError):
-                ok = False
-        if (info or {}).get('ensemble_policy'):
-            ok = bool(ok and info['ensemble_policy'] == 'weighted_soft_vote_consensus_v71'
-                      and (d or {}).get('ensemble_policy') == info['ensemble_policy']
-                      and (d or {}).get('ensemble_member_count',0) >= 2)
-        if (info or {}).get('professional_policy'):
-            audit=(d or {}).get('professional_audit') or {}
-            ok=bool(ok and info['professional_policy']=='professional_v72'
-                and audit.get('policy')==info['professional_policy'] and audit.get('passed') is True)
-        result[direction] = {
-            "approved": ok,
-            "reason": ("Kronolojik test doğrulaması mevcut" if ok else
-                       "TP/SL ilk temasına dayalı bağımsız yön testi yetersiz veya eski yöntem; sinyal kapalı"),
-            "validation": d,
-        }
+            plan = (info.get('risk_plan') or {}).get(direction) or {}
+            bracket_ok = all(_floor(plan.get(k), 0, strict=True) and _floor(6, plan.get(k)) for k in ('tp_atr', 'sl_atr'))
+            check('risk_plan', 'Eğitimde dondurulan TP/SL', plan.get('chosen_on'), 'training_only_or_predeclared',
+                  bracket_ok and plan.get('chosen_on') in ('training_only_stressed_net', 'predeclared_fallback'))
+        if info.get('artifact_schema', 0) >= 3 or 'decision_policy' in info:
+            from decision_policy import valid_policy
+            policy = info.get('decision_policy')
+            check('decision_policy', 'Doğrulamada dondurulan aday eşiği', policy.get('threshold') if isinstance(policy, dict) else None,
+                  'validation_only_frozen', valid_policy(policy))
+            check('validation_policy_passed', 'Seçilen eşik doğrulama testi',
+                  (policy.get('validation_passed') or {}).get(direction) if isinstance(policy, dict) else None,
+                  True, isinstance(policy, dict) and (policy.get('validation_passed') or {}).get(direction) is True)
+        if info.get('ensemble_policy'):
+            check('ensemble_policy', 'Çoklu model politikası', info.get('ensemble_policy'), 'weighted_soft_vote_consensus_v71',
+                  info.get('ensemble_policy') == 'weighted_soft_vote_consensus_v71' and d.get('ensemble_policy') == info.get('ensemble_policy'))
+            check('ensemble_member_count', 'Oylayan model sayısı', d.get('ensemble_member_count'), 2, _floor(d.get('ensemble_member_count'), 2))
+        if info.get('professional_policy'):
+            audit = d.get('professional_audit') or {}
+            check('professional_policy', 'Profesyonel kanıt politikası', audit.get('policy'), 'professional_v72',
+                  info.get('professional_policy') == 'professional_v72' and audit.get('policy') == info.get('professional_policy'))
+            for key, label in (('history', 'Profesyonel geçmiş uzunluğu'), ('independent_events', 'Profesyonel bağımsız olay sayısı'),
+                               ('resolution', 'Profesyonel sonuçlanma oranı'), ('family_screen', 'Çoklu model seçim düzeltmesi'),
+                               ('stressed_lower_bound', 'Stres başabaşının üstünde alt sınır'), ('stressed_mean', 'Profesyonel stres sonrası ortalama'),
+                               ('period_consistency', 'Üç kronolojik dönemin tutarlılığı')):
+                check('professional_'+key, label, (audit.get('checks') or {}).get(key), True, (audit.get('checks') or {}).get(key) is True)
+            check('professional_passed', 'Profesyonel test sonucu', audit.get('passed'), True, audit.get('passed') is True)
+        failed = [row for row in checks if not row['passed']]
+        ok = not failed
+        result[direction] = dict(approved=ok,
+            reason='Kronolojik test doğrulaması mevcut' if ok else '; '.join(row['label'] for row in failed),
+            validation=d or None, checks=checks, failed_checks=[row['id'] for row in failed])
     return result
 
 

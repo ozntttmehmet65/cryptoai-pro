@@ -26,8 +26,7 @@ def _rsi(close, period=14):
     delta=close.diff()
     rise=delta.clip(lower=0).ewm(alpha=1/period,adjust=False).mean()
     fall=(-delta.clip(upper=0)).ewm(alpha=1/period,adjust=False).mean()
-    result=100-(100/(1+rise/fall.replace(0,np.nan)))
-    return (result/100).fillna(0.5).clip(0,1)
+    return (rise/(rise+fall).replace(0,np.nan)).fillna(0.5).clip(0,1)
 
 
 def _higher(df, periods, prefix):

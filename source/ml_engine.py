@@ -81,7 +81,8 @@ def features(candles: list[dict], training: bool = False) -> pd.DataFrame:
     delta = close.diff()
     ups = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     downs = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
-    df["rsi14"] = (100 - (100 / (1 + ups / downs.replace(0, np.nan)))) / 100
+    # Zero losses imply RSI=100; flat prices imply neutral RSI=50.
+    df["rsi14"] = (ups / (ups + downs).replace(0, np.nan)).fillna(.5).clip(0, 1)
     vol = np.log1p(df["volume"].clip(lower=0))
     df["volume_z"] = (vol - vol.rolling(24).mean()) / vol.rolling(24).std().replace(0, np.nan)
     df["volume_change"] = vol.diff()
