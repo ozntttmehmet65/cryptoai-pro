@@ -449,7 +449,11 @@ async def stream_signal_worker():
             status["live_signals"] += 1
         except Exception as exc:
             log.warning("WebSocket inference %s: %s",symbol,str(exc)[:180])
-        finally:closed_queue.task_done()
+        finally:
+            closed_queue.task_done()
+            # A restored/all-market queue must not monopolize the event loop:
+            # let WebSocket handshakes, quotes and HTTP run between predictions.
+            await asyncio.sleep(0)
 
 
 def reconcile_paper(now_ms: int):
