@@ -141,6 +141,10 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(a['passed']);self.assertEqual(a['family_tests'],1400)
         self.assertTrue(all(s['independent_resolved']==10 for s in a['chronological_periods']))
         self.assertFalse(a['regimes']['EXTREME']['allowed'])
+    def test_numpy_training_outcomes_with_selected_candidates_are_json_safe(self):
+        a=professional_audit(np.ones(30,dtype=int),np.ones(30,dtype=int),
+            np.full(30,.01),np.arange(30)*86400000,1,2.5,1.5,np.full(30,'RANGE'),18000)
+        self.assertTrue(a['passed']);json.dumps(a,allow_nan=False)
     def test_unresolved_spacing_and_negative_period_not_cherry_picked(self):
         a=professional_audit([1]*30,[1]*20+[-1]*10,[.01]*30,np.arange(30)*86400000,1,2.5,1.5,['RANGE']*30,18000)
         self.assertFalse(a['checks']['period_consistency'])
