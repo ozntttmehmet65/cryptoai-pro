@@ -17,7 +17,7 @@ import time
 import joblib
 import numpy as np
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, ExtraTreesClassifier
 from sklearn.metrics import brier_score_loss
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -39,6 +39,10 @@ COIN_EVALUATION_METHOD = "tp_sl_first_touch_adaptive_bracket_24h_v5"
 STRESS_ROUND_TRIP_COST = 0.0040
 MIN_VALID_RESOLVED = 35
 PURGE_MS = (EVALUATION_BARS + 1) * INTERVAL_MS
+ENSEMBLE_POLICY = "weighted_soft_vote_consensus_v71"
+MAX_VOTE_SPREAD = .20
+MIN_VOTE_SUPPORT = .60
+MEMBER_SUPPORT_THRESHOLD = .60
 
 
 
@@ -89,13 +93,23 @@ class CoinModelRegistry:
         return symbol in self.metadata and self._artifact_path(symbol).exists()
 
     def permissions(self, symbol):
-        return model_permissions(self.info(symbol))
+        result = model_permissions(self.info(symbol))
+        if not self.ensemble_ready(symbol):
+            for side in result.values():
+                side.update(approved=False, reason="Çoklu model eğitimi bekleniyor; eski tek model ana sinyal üretmez")
+        return result
+
+    def ensemble_ready(self, symbol):
+        return bool(self.ready(symbol) and
+                    (self.info(symbol) or {}).get("ensemble_policy") == ENSEMBLE_POLICY)
 
     def training_due(self, symbol, now=None, interval_hours=6, retry_seconds=3600):
         now = now or time.time()
         info = self.info(symbol)
         if info is None:
             return True
+        if not self.ensemble_ready(symbol):
+            return True  # Migrate immediately, even if the old model is recent.
         # Last successful per-symbol training, not the global model's time.
         trained = _time_of(info.get("trained_at"))
         return now - trained >= interval_hours * 3600
@@ -106,6 +120,9 @@ class CoinModelRegistry:
         approved_long = sum(self.permissions(s)["LONG"]["approved"] for s in trained)
         approved_short = sum(self.permissions(s)["SHORT"]["approved"] for s in trained)
         return {"eligible": len(pool), "trained": len(trained),
+                "ensemble_trained": sum(self.ensemble_ready(s) for s in trained),
+                "ensemble_pending": sum(not self.ensemble_ready(s) for s in pool),
+                "ensemble_policy": ENSEMBLE_POLICY,
                 "pending": max(0, len(pool)-len(trained)),
                 "approved_long": approved_long, "approved_short": approved_short,
                 "both_directions_blocked": sum(not (self.permissions(s)["LONG"]["approved"] or self.permissions(s)["SHORT"]["approved"]) for s in trained)}
@@ -131,6 +148,8 @@ class CoinModelRegistry:
             ("HistGradientBoosting", HistGradientBoostingClassifier(
                 max_iter=55, max_leaf_nodes=7, min_samples_leaf=24,
                 learning_rate=.06, l2_regularization=5.0, random_state=42)),
+            ("ExtraTrees", ExtraTreesClassifier(n_estimators=48, max_depth=6,
+                min_samples_leaf=24, max_features=.7, n_jobs=1, random_state=42)),
         )
 
     @staticmethod
@@ -138,8 +157,41 @@ class CoinModelRegistry:
         # Class 1 = TP touched before SL, class 0 = SL touched before TP.
         if model is None:
             return np.zeros(len(data), dtype=float)
+        if isinstance(model, dict) and model.get("kind") == ENSEMBLE_POLICY:
+            members = model.get("members") or []
+            weights = np.asarray(model.get("weights") or [], dtype=float)
+            if (len(members) < 2 or len(weights) != len(members)
+                or not np.isfinite(weights).all() or (weights <= 0).any()
+                or not np.isclose(weights.sum(), 1)):
+                raise ValueError("Invalid ensemble members/weights")
+            votes = np.stack([CoinModelRegistry._predict_tp(m["model"], data) for m in members])
+            if not np.isfinite(votes).all():
+                raise ValueError("Non-finite ensemble prediction")
+            return np.average(votes, axis=0, weights=weights)
         order = list(model.classes_)
         return np.asarray(model.predict_proba(data)[:,order.index(1)], dtype=float)
+
+    @classmethod
+    def vote_details(cls, model, calibration, data):
+        """Frozen consensus policy shared by unseen evaluation and live inference."""
+        if not isinstance(model, dict) or model.get("kind") != ENSEMBLE_POLICY:
+            return np.zeros(len(data)), np.zeros(len(data), dtype=bool), []
+        raw = cls._predict_tp(model, data)  # Validate the whole payload first.
+        votes = np.stack([cls.calibrated(cls._predict_tp(m["model"], data), calibration)
+                          for m in model["members"]])
+        weights = np.asarray(model["weights"], dtype=float)
+        spread = votes.max(axis=0) - votes.min(axis=0)
+        supporters = votes >= MEMBER_SUPPORT_THRESHOLD
+        support_weight = np.sum(supporters * weights[:, None], axis=0)
+        agreement = ((spread <= MAX_VOTE_SPREAD) & (support_weight >= MIN_VOTE_SUPPORT)
+                     & (supporters.sum(axis=0) >= 2))
+        details = [{"members": [{"name": m["name"], "weight": round(float(w), 6),
+                                  "tp_score": round(float(votes[j, i]), 4)}
+                                 for j, (m, w) in enumerate(zip(model["members"], weights))],
+                    "spread": round(float(spread[i]), 4),
+                    "support_weight": round(float(support_weight[i]), 4),
+                    "agreement": bool(agreement[i])} for i in range(len(data))]
+        return cls.calibrated(raw, calibration), agreement, details
 
     @staticmethod
     def calibrated(raw, calibration):
@@ -215,6 +267,7 @@ class CoinModelRegistry:
         models = {}
         model_comparison = {}
         test_probs = {}
+        test_agreement = {}
         calibrations = {}
         for direction, col in (("LONG", "long_outcome"), ("SHORT", "short_outcome")):
             # An unresolved 24-hour window is CENSORED, not an SL and not
@@ -235,14 +288,15 @@ class CoinModelRegistry:
                 models[direction] = None
                 calibrations[direction] = None
                 test_probs[direction] = np.zeros(len(test))
+                test_agreement[direction] = np.zeros(len(test), dtype=bool)
                 continue
             x_tr = tr[COLS].to_numpy(dtype=float)
             x_va = va[COLS].to_numpy(dtype=float)
             baseline_rate = float(tr_y.mean())
             baseline_brier = float(np.mean((va_y-baseline_rate)**2))
             comparison["validation_baseline_brier"] = round(baseline_brier,6)
-            champion = None
-            best_brier = float("inf")
+            members = []
+            scores = []
             for name, candidate in self._candidates():
                 try:
                     candidate.fit(x_tr, tr_y)
@@ -250,31 +304,41 @@ class CoinModelRegistry:
                     brier = float(brier_score_loss(va_y,predicted))
                     comparison["candidates"][name] = {"validation_brier":round(brier,6),
                             "validation_samples":len(va)}
-                    # Prefer simpler LogisticRegression on practically tied metrics.
-                    if brier < best_brier - .005 or champion is None:
-                        champion = (name,candidate)
-                        best_brier = brier
+                    members.append({"name": name, "model": candidate})
+                    scores.append(brier)
                 except (ValueError, FloatingPointError) as exc:
                     comparison["candidates"][name] = {"error":str(exc)[:160]}
             # Avoid a complex winner without evidence it beats a non-ML base rate.
             # Still persist a candidate for audit, but never approve it for trading.
-            if champion is None:
+            if len(members) < 2:
                 models[direction] = None
+                calibrations[direction] = None
                 test_probs[direction] = np.zeros(len(test))
-                comparison["reason"] = "Both candidate algorithms failed"
+                test_agreement[direction] = np.zeros(len(test), dtype=bool)
+                comparison["reason"] = "At least two trained voting models are required"
                 continue
-            name, winner = champion
-            comparison["chosen"] = name
+            # Fixed inverse-Brier weights use VALIDATION ONLY, never holdout.
+            # Positive bounded weights keep all successfully trained algorithms.
+            weights = 1 / np.maximum(np.asarray(scores, dtype=float), .05)
+            weights /= weights.sum()
+            winner = {"kind": ENSEMBLE_POLICY, "members": members,
+                      "weights": weights.tolist()}
+            raw_validation = self._predict_tp(winner, x_va)
+            best_brier = float(brier_score_loss(va_y, raw_validation))
+            comparison["chosen"] = "WeightedSoftVoting"
+            comparison["weights"] = {m["name"]:round(float(w),8) for m,w in zip(members,weights)}
+            comparison["weight_source"] = "chronological_validation_only_inverse_brier"
+            comparison["member_count"] = len(members)
             comparison["chosen_validation_brier"] = round(best_brier,6)
             comparison["beat_baseline"] = best_brier < baseline_brier - .005
             comparison["validation_win_rate"] = round(float(va_y.mean()),5)
             models[direction] = winner
             calibration = self.fit_calibration(
-                self._predict_tp(winner,x_va), va_y, baseline_rate)
+                raw_validation, va_y, baseline_rate)
             calibrations[direction] = calibration
             comparison["calibration"] = calibration
-            test_probs[direction] = self.calibrated(
-                self._predict_tp(winner, X_test), calibration)
+            test_probs[direction], test_agreement[direction], _ = self.vote_details(
+                winner, calibration, X_test)
         if all(model is None for model in models.values()):
             raise ValueError("No direction has sufficient resolved TP/SL events for training")
         p_long = test_probs["LONG"]
@@ -282,6 +346,8 @@ class CoinModelRegistry:
         actions = np.zeros(len(test),dtype=int)
         for i in range(len(test)):
             d,_ = self.decision(p_long[i],p_short[i])
+            if d in ("LONG", "SHORT") and not test_agreement[d][i]:
+                d = "BEKLE"
             actions[i] = 1 if d == "LONG" else -1 if d == "SHORT" else 0
         outcomes = test[["long_outcome","short_outcome"]].to_numpy(dtype=int)
         atrs = test["atr_pct"].to_numpy(dtype=float)
@@ -313,6 +379,8 @@ class CoinModelRegistry:
                 round(float(np.mean(stressed)),6) if stressed else None)
             validation[direction]["stress_cost_assumption"] = STRESS_ROUND_TRIP_COST
             validation[direction]["model_choice"] = detail.get("chosen")
+            validation[direction]["ensemble_policy"] = ENSEMBLE_POLICY
+            validation[direction]["ensemble_member_count"] = detail.get("member_count",0)
             # Overlapping 24h first-touch labels are correlated: effective
             # independent evidence is smaller than raw 15m signal count.
             independent = 0
@@ -374,10 +442,14 @@ class CoinModelRegistry:
                 "test_method":"fixed_score>=6.5; purged chronological unseen TP/SL first touch (24h censored)",
                 "notice":"Exploratory technical confirmation; historical correlation and multiple-comparison risk. Not guaranteed live P(TP)."}
         date = datetime.now(timezone.utc)
-        version = date.strftime("coin-%Y%m%dT%H%M%SZ") + "-" + symbol + "-v60"
+        version = date.strftime("coin-%Y%m%dT%H%M%SZ") + "-" + symbol + "-v71"
         info = {
             "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":2,
-            "algorithm":"Per-direction logistic/gradient booster + training-frozen TP/SL grid and validation Brier shrinkage",
+            "algorithm":"Per-direction LogisticRegression + HistGradientBoosting + ExtraTrees weighted soft voting, validation-only calibration and fixed consensus veto",
+            "ensemble_policy": ENSEMBLE_POLICY,
+            "consensus_policy": {"max_score_spread":MAX_VOTE_SPREAD,
+                "min_support_weight":MIN_VOTE_SUPPORT, "member_score_threshold":MEMBER_SUPPORT_THRESHOLD,
+                "min_supporters":2, "minimum_members":2, "threshold_source":"predeclared_not_holdout_tuned"},
             "trained_at":date.isoformat(), "train_samples":len(train),
             "validation_samples":len(valid), "test_samples":len(test),
             "last_labelled_candle":int(frame["time"].max()),
@@ -400,7 +472,8 @@ class CoinModelRegistry:
         file_key = symbol_file_key(symbol)
         tmp_model = self.directory / f".{file_key}.tmp.joblib"
         tmp_info = self.directory / f".{file_key}.tmp.json"
-        payload={"models":models,"calibration":calibrations,"version":version,"model_family":MODEL_FAMILY}
+        payload={"models":models,"calibration":calibrations,"version":version,"model_family":MODEL_FAMILY,
+                 "ensemble_policy":ENSEMBLE_POLICY}
         joblib.dump(payload,tmp_model,compress=2)
         tmp_info.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding="utf-8")
         os.replace(tmp_model,artifact)
@@ -423,7 +496,7 @@ class CoinModelRegistry:
             # never untrusted user model uploads.
             model = joblib.load(self._artifact_path(symbol))
             info=self.info(symbol) or {}
-            if info.get("artifact_schema")==2 and (not isinstance(model,dict) or model.get("version")!=info.get("version") or model.get("model_family")!=MODEL_FAMILY):
+            if (info.get("artifact_schema")==2 or isinstance(model,dict) and model.get("version")) and (not isinstance(model,dict) or model.get("version")!=info.get("version") or model.get("model_family")!=MODEL_FAMILY or model.get("ensemble_policy")!=info.get("ensemble_policy")):
                 LOG.warning("Model and metadata version mismatch: %s",symbol)
                 return None
             self.cache[symbol] = model
@@ -436,10 +509,12 @@ class CoinModelRegistry:
 
     def infer(self, symbol, candles, now_ms=None):
         info = self.info(symbol)
-        if info is None or info.get("model_family") != MODEL_FAMILY:
+        if info is None or info.get("model_family") != MODEL_FAMILY or not self.ensemble_ready(symbol):
             return None
         models = self._load(symbol)
         if models is None or not isinstance(models,dict) or not isinstance(models.get("models"),dict):
+            return None
+        if models.get("ensemble_policy") != ENSEMBLE_POLICY or models.get("version") != info.get("version"):
             return None
         now_ms = now_ms or int(time.time()*1000)
         closed = sorted((c for c in candles if c["close_time"] < now_ms),key=lambda c:c["time"])
@@ -462,15 +537,17 @@ class CoinModelRegistry:
         technical["status"] = ("DOĞRULANDI" if technical_gate.get("approved") else "TEST ADAYI") if technical_direction else "FIRSAT BEKLENIYOR"
         technical["holdout"] = technical_gate if technical_direction else None
         X = last[COLS].to_numpy(dtype=float).reshape(1,-1)
-        p_long = float(self.calibrated(
-            self._predict_tp(models["models"].get("LONG"),X),
-            models["calibration"].get("LONG"))[0])
-        p_short = float(self.calibrated(
-            self._predict_tp(models["models"].get("SHORT"),X),
-            models["calibration"].get("SHORT"))[0])
+        lp, la, ld = self.vote_details(models["models"].get("LONG"), models["calibration"].get("LONG"), X)
+        sp, sa, sd = self.vote_details(models["models"].get("SHORT"), models["calibration"].get("SHORT"), X)
+        p_long, p_short = float(lp[0]), float(sp[0])
+        voting = {"policy":ENSEMBLE_POLICY, "LONG":ld[0] if ld else None,
+                  "SHORT":sd[0] if sd else None}
         candidate, confidence = self.decision(p_long,p_short)
         reason = None
         signal = candidate
+        if signal in ("LONG", "SHORT") and not (la[0] if signal == "LONG" else sa[0]):
+            reason = "Model oyları yeterince uzlaşmıyor; BEKLE"
+            signal, confidence = "BEKLE", 0.0
         if signal != "BEKLE" and not self.permissions(symbol)[signal]["approved"]:
             reason = "TP/SL test veya stress maliyet onayi yok; guvenlik kilidi"
             signal,confidence="BEKLE",0.0
@@ -493,6 +570,7 @@ class CoinModelRegistry:
             signal,confidence='BEKLE',0.0
         return {"signal":signal,"confidence":round(confidence,4) if signal!="BEKLE" else None,
                 "p_long":round(p_long,4),"p_short":round(p_short,4),
+                "ensemble":voting,
                 # LONG/SHORT scores are NOT a 3-class distribution.
                 "p_wait":None, "blocked_reason":reason,
                 "candidate_signal":candidate if candidate != "BEKLE" else None,

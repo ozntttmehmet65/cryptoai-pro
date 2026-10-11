@@ -105,6 +105,10 @@ def model_permissions(info: dict | None) -> dict:
                     and plan.get('chosen_on') in ('training_only_stressed_net','predeclared_fallback'))
             except (ValueError,TypeError):
                 ok = False
+        if (info or {}).get('ensemble_policy'):
+            ok = bool(ok and info['ensemble_policy'] == 'weighted_soft_vote_consensus_v71'
+                      and (d or {}).get('ensemble_policy') == info['ensemble_policy']
+                      and (d or {}).get('ensemble_member_count',0) >= 2)
         result[direction] = {
             "approved": ok,
             "reason": ("Kronolojik test doğrulaması mevcut" if ok else
