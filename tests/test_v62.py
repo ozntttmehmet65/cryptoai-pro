@@ -91,6 +91,27 @@ class ApiTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.app.db.close();cls.data.cleanup()
 
+    def test_inference_queue_yields_to_network_between_predictions(self):
+        import asyncio
+        from contextlib import suppress
+        a=self.app
+        async def check():
+            queue=asyncio.Queue();trace=[]
+            for symbol in ('BTCUSDT','ETHUSDT'):queue.put_nowait(symbol)
+            def infer(symbol,candles):
+                trace.append(symbol);return {'candle_time':NOW,'model_version':'test'}
+            async def network():trace.append('network')
+            with patch.object(a,'closed_queue',queue),patch.object(a,'universe',{'BTCUSDT':{},'ETHUSDT':{}}),patch.object(a,'signals',{}),\
+                 patch.object(a.coin_engine,'ready',return_value=True),patch.object(a.coin_engine,'infer',side_effect=infer),\
+                 patch.object(a,'contiguous_recent',return_value=[{}]),patch.object(a,'freshness_ok',return_value=True),patch.object(a,'_save_signal'):
+                worker=asyncio.create_task(a.stream_signal_worker());other=asyncio.create_task(network())
+                await other
+                await queue.join()
+                worker.cancel()
+                with suppress(asyncio.CancelledError):await worker
+            self.assertLess(trace.index('network'),trace.index('ETHUSDT'))
+        asyncio.run(check())
+
     def test_all_views_use_the_same_dynamic_entry_gate(self):
         import asyncio
         a=self.app;now=time.time();p=prediction();p['candle_time']=int(now*1000)-1_000_000
