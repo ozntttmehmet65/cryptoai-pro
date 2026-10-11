@@ -1,5 +1,26 @@
 # CryptoAI Pro V7.3
 
+## V7.3.1 live quote / timestamp repair
+
+- A single strict 10-second quote-freshness policy drives execution checks and
+  health coverage. Missing, invalid, future and stale quotes have separate
+  explanations; exact event age is exposed in execution and market responses.
+- The UI shows per-coin event age, including during a silent/disconnected feed.
+  It uses server time plus monotonic elapsed time, not the phone clock. ISO
+  snapshot timestamps and numeric stream timestamps are normalized before
+  rejecting out-of-order quotes. Prices up to 120 seconds old may be displayed
+  with a stale label, but never pass the 10-second execution gate.
+- Both streamed and optional REST inference run off the network event loop,
+  serialized with an async lock. SQLite and signal publication remain on the
+  event loop. This improves network responsiveness; it does not add CPU or
+  guarantee continuous exchange delivery. No timestamps are fabricated and
+  no model, entry, bid/ask, spread or risk gate is relaxed.
+- Daily rejection counts are explicitly labelled historical, not current
+  outages. Existing stored decisions, models and V7.3 migration are retained.
+
+Verification: Python regression suite plus `node tests/test_quote_ui.cjs`,
+`node --check source/static/app.js`, and `git diff --check`.
+
 Read-only Binance USD-M futures analysis and forward paper observations. No exchange order is sent. Docker builds the readable `source/` tree; the existing `/app/data` disk, SQLite database and `coin_models_v60` paths are preserved.
 
 ## Professional main-system policy
