@@ -209,9 +209,10 @@ async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
   if(obj.scope==='independent_model_per_symbol'){
     let x=obj.coin_training||{},total=x.eligible||0,trained=x.professional_trained||0;
     setText('homeVersion',`${trained}/${total} profesyonel model`);
-    setChip('modelTag',trained>0,`${trained}/${total} EĞİTİLDİ`);
+    setChip('modelTag',trained>0,`${trained}/${total} PROFESYONEL`);
     setText('modelAlgo','Logistic + Gradient Boosting + Extra Trees · ağırlıklı oy');
-    setText('modelVersion','Her coin için ayrı sürüm');
+    const migration=`V7.3 geçişi: ${x.pipeline_trained||0}/${total} · Bekleyen: ${x.pipeline_pending??total}`;
+    setText('modelVersion',migration);
     setText('modelDate','Her coin için ayrı tarih');
     setText('modelDates','Hedef 18.000 gerçek 15dk mum (yaklaşık 187 gün); yeni coinler daha kısa olabilir');
     setText('trainSize','Coin bazında');setText('valSize','Kronolojik ayrım');
@@ -224,12 +225,12 @@ async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
     let pendingInfo = state.health?.coin_training?.pending_symbols||[];
     let failureInfo = state.health?.coin_training?.pending_reasons||{};
     let issueText = pendingInfo.length?` Bekleyenler: ${pendingInfo.join(', ')}. ${Object.entries(failureInfo).map(([s,r])=>s+': '+r).join('; ')}`:'';
-    setText('coinTrainingDetails',`7/24 sırayla eğitim · Coin başına ${state.health?.coin_training?.refresh_interval_hours||6} saat aralıklı yenileme. ${trained}/${total} coin eğitildi. Detaylar: /api/coin-models.${issueText}`);
+    setText('coinTrainingDetails',`${migration}. Geçiş bekleyenler işlem hacmine göre sırayla eğitilir. Coin başına ${state.health?.coin_training?.refresh_interval_hours||6} saat aralıklı yenileme. ${trained}/${total} profesyonel model. Detaylar: /api/coin-models.${issueText}`);
     const diag=state.health?.signal_diagnostics;
     if(diag){
       const reasons=Object.entries(diag.model_rejections||{}).flatMap(([side,rows])=>rows.slice(0,3).map(row=>`${side}: ${row.reason} (${row.count} model)`));
       const stages=diag.stages||{};
-      setText('coinTrainingDetails',`${trained}/${total} model · Canlı hesaplama için ${diag.required_inference_bars} kapanmış mum. Veri bekleyen: ${stages.history_pending||0} · Eşik/yön teyidi bekleyen: ${stages.score_or_direction_margin||0} · Giriş onayı: ${stages.entry_approved||0}. ${reasons.join(' · ')}. Ret koşulları aynı modelde birlikte bulunabilir. Ayrıntı: /api/signal-diagnostics.${issueText}`);
+      setText('coinTrainingDetails',`${migration}. ${trained}/${total} profesyonel model · Canlı hesaplama için ${diag.required_inference_bars} kapanmış mum. Veri bekleyen: ${stages.history_pending||0} · Eşik/yön teyidi bekleyen: ${stages.score_or_direction_margin||0} · Giriş onayı: ${stages.entry_approved||0}. ${reasons.join(' · ')}. Ret koşulları aynı modelde birlikte bulunabilir. Ayrıntı: /api/signal-diagnostics.${issueText}`);
     }
     return;
   }
