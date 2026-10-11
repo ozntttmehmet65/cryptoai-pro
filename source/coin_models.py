@@ -157,15 +157,21 @@ class CoinModelRegistry:
     def professional_ready(self, symbol):
         return bool(self.ensemble_ready(symbol) and (self.info(symbol) or {}).get('professional_policy')==PROFESSIONAL_POLICY)
 
+    def pipeline_ready(self, symbol):
+        info = self.info(symbol) or {}
+        return bool(self.professional_ready(symbol)
+                    and info.get('training_pipeline_version') == TRAINING_PIPELINE_VERSION
+                    and isinstance(info.get('artifact_schema'), int)
+                    and info.get('artifact_schema', 0) >= 3
+                    and valid_policy(info.get('decision_policy')))
+
     def training_due(self, symbol, now=None, interval_hours=6, retry_seconds=3600):
         now = now or time.time()
         info = self.info(symbol)
         if info is None:
             return True
-        if not self.professional_ready(symbol):
-            return True  # Migrate immediately, even if the old model is recent.
-        if info.get("training_pipeline_version") != TRAINING_PIPELINE_VERSION:
-            return True
+        if not self.pipeline_ready(symbol):
+            return True  # Migrate immediately, even if an old professional model is recent.
         # Last successful per-symbol training, not the global model's time.
         trained = _time_of(info.get("trained_at"))
         return now - trained >= interval_hours * 3600
@@ -181,6 +187,9 @@ class CoinModelRegistry:
                 "ensemble_policy": ENSEMBLE_POLICY,
                 "professional_trained":sum(self.professional_ready(s) for s in trained),
                 "professional_pending":sum(not self.professional_ready(s) for s in pool),
+                "training_pipeline_version": TRAINING_PIPELINE_VERSION,
+                "pipeline_trained": sum(self.pipeline_ready(s) for s in trained),
+                "pipeline_pending": sum(not self.pipeline_ready(s) for s in pool),
                 "history_target":HISTORY_TARGET,
                 "pending": max(0, len(pool)-len(trained)),
                 "approved_long": approved_long, "approved_short": approved_short,
