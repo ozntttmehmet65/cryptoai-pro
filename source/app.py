@@ -603,8 +603,11 @@ async def coin_training_worker():
         if not COIN_AUTO_TRAIN or not universe:
             await asyncio.sleep(30)
             continue
-        symbols = sorted(universe, key=lambda s: (coin_engine.professional_ready(s),
-                         -tickers.get(s,{}).get("quote_volume",0)))
+        # A V7.2 professional artifact still needs the V7.3 RSI/policy repair.
+        # Prioritize all outstanding pipeline migrations by current volume;
+        # failed/new-listing histories retain their existing retry backoff.
+        symbols = sorted(universe, key=lambda s: (coin_engine.pipeline_ready(s),
+                         -tickers.get(s,{}).get("quote_volume",0), s))
         force = bool(status["coin_force_refresh"])
         status["coin_force_refresh"] = False
         for symbol in symbols:
