@@ -19,20 +19,23 @@ def prediction(side='LONG'):
         tp_atr=2.5, sl_atr=1.5, target_estimate=102.5, stop_estimate=98.5,
         model_version='test', technical={})
 
+def book(age=1.):
+    return dict(bid=99.99, ask=100.01, bid_qty=100., ask_qty=100., updated_at=NOW/1000-age)
+
 def quote(price=100., age=1.):
     return dict(price=price, updated_at=NOW/1000-age)
 
 class EntryTests(unittest.TestCase):
     def test_valid_never_promotes_unapproved_model(self):
         p=prediction()
-        self.assertTrue(entry_check(p,quote(),NOW)['approved'])
-        self.assertEqual(guarded_prediction(p,quote(),NOW,False)['signal'],'BEKLE')
+        self.assertTrue(entry_check(p,quote(),NOW,book())['approved'])
+        self.assertEqual(guarded_prediction(p,quote(),NOW,False,book=book())['signal'],'BEKLE')
         self.assertEqual(p['signal'],'LONG')
 
     def test_stale_future_missing_nonfinite_quotes(self):
         for q in [quote(age=10),quote(age=-1),{},quote(float('nan')),quote(float('inf'))]:
             with self.subTest(q=q):
-                result=guarded_prediction(prediction(),q,NOW,True)
+                result=guarded_prediction(prediction(),q,NOW,True,book=book())
                 u=combined_assessment(result)
                 self.assertFalse(u['approved'])
                 self.assertEqual(u['status'],'BEKLE')
@@ -42,18 +45,18 @@ class EntryTests(unittest.TestCase):
     def test_departure_and_expired_or_unclosed_candle(self):
         for changes,q in [({},quote(100.4)),({'candle_time':NOW-1_800_001},quote()),({'candle_time':NOW},quote())]:
             p=prediction();p.update(changes)
-            self.assertFalse(entry_check(p,q,NOW)['approved'])
+            self.assertFalse(entry_check(p,q,NOW,book())['approved'])
 
     def test_cost_and_live_drift_veto_both_sides(self):
         for side in ['LONG','SHORT']:
             p=prediction(side)
-            self.assertEqual(guarded_prediction(p,quote(),NOW,True,True)['signal'],'BEKLE')
+            self.assertEqual(guarded_prediction(p,quote(),NOW,True,True,book=book())['signal'],'BEKLE')
             p['risk_atr_pct']=.0001
-            self.assertFalse(entry_check(p,quote(),NOW)['approved'])
+            self.assertFalse(entry_check(p,quote(),NOW,book())['approved'])
 
     def test_rest_observation_cannot_receive_approved_blocked_signal(self):
         db=sqlite3.connect(':memory:');setup(db)
-        p=guarded_prediction(prediction(),quote(101),NOW,True)
+        p=guarded_prediction(prediction(),quote(101),NOW,True,book=book())
         self.assertFalse(observe(db,'BTCUSDT',p,101,NOW))
         self.assertEqual(report(db)['summary']['observed'],0)
         db.close()
@@ -95,6 +98,7 @@ class ApiTests(unittest.TestCase):
         a.universe['BTCUSDT']={'base':'BTC','quote':'USDT'}
         a.signals['BTCUSDT']=p
         a.tickers['BTCUSDT']={'price':101,'updated_at':now-1,'quote_volume':100}
+        a.books['BTCUSDT']=dict(book(),updated_at=now-1)
         a.status['tickers_updated']=now
         with patch.object(a.coin_engine,'version',return_value='test'),patch.object(a.coin_engine,'permissions',return_value={'LONG':{'approved':True}}),patch.object(a,'_live_symbols',return_value=[]),patch.object(a,'_current_drift',return_value=False):
             m=asyncio.run(a.markets(limit=20))
