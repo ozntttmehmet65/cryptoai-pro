@@ -2,6 +2,25 @@
 // No client-side fabricated quotes/signals. ALL values originate from backend responses.
 const $ = id => document.getElementById(id);
 const state = {page:'overview',rows:[],pageSize:120,visible:120,total:0,health:null,model:null,selected:'BTCUSDT',period:'15m',detailNonce:0};
+// Server epoch + monotonic elapsed time: device clock/timezone cannot age quotes.
+let serverClock=null;
+function syncServerClock(ms){if(Number.isFinite(ms)&&ms>0){const now=performance.now();if(!serverClock||ms>=serverClock.ms+(now-serverClock.at))serverClock={ms,at:now}}}
+function quoteNow(){return serverClock?(serverClock.ms+performance.now()-serverClock.at)/1000:null}
+function quoteStamp(value){if(value===null||value===undefined)return NaN;return typeof value==='number'?value:Date.parse(value)/1000}
+function quoteLabel(row){
+  const now=quoteNow(),stamp=quoteStamp(row?.quote_updated_at);
+  if(!Number.isFinite(stamp)||!row?.price)return 'Fiyat bekleniyor';
+  if(now===null)return 'Saat doğrulanıyor';
+  const age=now-stamp;
+  if(age<0)return 'Zaman damgası ileride';
+  return (age<10?'Güncel · ':'Gecikmiş · ')+n(Math.floor(age),0)+' sn';
+}
+function paintQuoteCell(cell,row){cell.replaceChildren(document.createTextNode(price(row.price)),elem('div',{className:'small muted'},quoteLabel(row)));cell.title='Son borsa olayı: '+(row.quote_updated_at?dt(quoteStamp(row.quote_updated_at)*1000):'—')}
+function refreshQuoteAges(){
+  const rows=new Map(state.rows.map(r=>[r.symbol,r]));
+  for(const id of ['overviewRows','signalsRows'])for(const tr of $(id)?.rows||[]){const row=rows.get(tr.cells[0]?.textContent.trim());if(row&&tr.cells.length>=4)paintQuoteCell(tr.cells[1],row)}
+  if(state.page==='details'){const row=rows.get(state.selected);setText('selectedLivePrice','Son fiyat: '+price(row?.price)+' · '+quoteLabel(row))}
+}
 const pageTitles={overview:'Genel Bakış',signals:'AI Sinyaller',details:'Grafik ve Detay',performance:'Geçmiş Performans',paper:'Sanal Sinyal Takibi',model:'Model Durumu',quality:'Kalite Raporu',settings:'Ayarlar ve Risk'};
 const trTime = new Intl.DateTimeFormat('tr-TR',{timeZone:'Europe/Istanbul',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
 function dt(v){try{return v?trTime.format(new Date(v)): '—'}catch{return '—'}}
@@ -22,6 +41,7 @@ function navigate(page){state.page=page;document.querySelectorAll('.page').forEa
 function setError(message){let el=$('siteError');el.textContent=message||'';el.classList.toggle('hidden',!message)}
 function setChip(id,ready,text){let el=$(id);if(!el)return;el.className='chip '+(ready?'green':'amber');el.textContent=text}
 function paintHealth(h){state.health=h;let ready=h.provider_ok&&h.model_ready;
+  syncServerClock(h.server_time);
   const monitor=h.execution_monitor||{};
   setText('bookCoverage',`${monitor.fresh_books||0} / ${monitor.total_symbols||0}`);
   setText('entryCandidates',String(monitor.active_candidates||0));setText('entryPassed',String(monitor.entry_passed||0));
@@ -44,7 +64,7 @@ function paintHealth(h){state.health=h;let ready=h.provider_ok&&h.model_ready;
   setText('statTechShort',String(h.unified_counts?.short??'—'));
   setText('homeTechnical',`Birleşik sistem: ${h.unified_counts?.islem_sinyali||0} işlem onaylı · ${h.unified_counts?.takip_et||0} takip · ${h.unified_counts?.bekle||0} bekle`);
   setText('homeTraining',`7/24 oylama eğitimi: ${coins.ensemble_trained||0}/${coins.eligible||h.symbol_count||0} · LONG testli: ${coins.approved_long||0} · SHORT testli: ${coins.approved_short||0}`);
-  setText('homeFresh',h.binance_cooldown_seconds>0?(h.provider_ok?'WebSocket fiyatı var · REST beklemede':'REST beklemede: '+h.binance_cooldown_seconds+' sn'):h.provider_ok?'WebSocket piyasa verisi var':'Veri güncel değil');
+  setText('homeFresh',h.provider_ok?`${h.quote_coverage?.fresh||0}/${h.symbol_count||0} fiyat 10 sn'den yeni · ${h.quote_coverage?.stale||0} gecikmiş`:'Veri güncel değil');
   setText('updateTime',h.data_updated_at?(h.provider_ok?'Veri: ':'Eski veri: ')+dt(h.data_updated_at):'Güncelleme bekleniyor');
   setText('storageNotice',h.storage_persistent_configured?'Kalıcı disk ayarı bildirildi':'Kalıcı disk doğrulanmadı; yeniden başlatmada veriler kaybolabilir');
   setText('liveKlineState',h.kline_websocket||'Bekleniyor');
@@ -63,7 +83,7 @@ function decisionBadge(u){
 }
 function rowCells(row,details=false){
   let t=elem('tr');let sym=elem('td');sym.append(elem('span',{},row.symbol));t.append(sym);
-  t.append(elem('td',{},price(row.price)));
+  const priceCell=elem('td');paintQuoteCell(priceCell,row);t.append(priceCell);
   t.append(elem('td',{className:row.change_pct>=0?'positive':'negative'},pct(row.change_pct)));
   t.append(elem('td',{},abbr(row.quote_volume)));
   const u=row.unified||{};let c=elem('td');c.append(decisionBadge(u));t.append(c);
@@ -81,7 +101,10 @@ function rowCells(row,details=false){
   }else{t.style.cursor='pointer';t.title='Grafiği aç';t.addEventListener('click',()=>{state.selected=row.symbol;navigate('details')})}
   return t;
 }
-function paintMarkets(data){state.rows=data.rows||[];state.total=data.total||0;state.visible=state.pageSize;
+function paintMarkets(data){
+  const previous=new Map(state.rows.map(r=>[r.symbol,r]));
+  state.rows=(data.rows||[]).map(row=>{const old=previous.get(row.symbol);return old&&quoteStamp(old.quote_updated_at)>quoteStamp(row.quote_updated_at)?{...row,price:old.price,change_pct:old.change_pct,quote_volume:old.quote_volume,quote_updated_at:old.quote_updated_at}:row});state.total=data.total||0;state.visible=state.pageSize;
+  syncServerClock(data.server_time);
   let home=$('overviewRows');home.replaceChildren();if(!state.rows.length){let tr=elem('tr');tr.append(elem('td',{colspan:'6',className:'placeholder'},'Uygun piyasa kaydı yok. Veri kaynağını kontrol edin.'));home.append(tr)}
   [...state.rows].sort((a,b)=>(b.unified?.status==='İŞLEM SİNYALİ'?2:b.unified?.status==='TAKİP ET'?1:0)-(a.unified?.status==='İŞLEM SİNYALİ'?2:a.unified?.status==='TAKİP ET'?1:0)||(b.unified?.score||0)-(a.unified?.score||0)).slice(0,9).forEach(r=>home.append(rowCells(r)));
   fillSymbolPicker();paintSignals();
@@ -109,14 +132,15 @@ function markQuoteConnection(text){setText('quoteStreamStatus',text)}
 function applyQuoteChanges(quotes){
   if(!quotes||typeof quotes!=='object')return;
   const bySymbol=new Map(state.rows.map(row=>[row.symbol,row]));
-  const changed=new Map(),now=Date.now()/1000;
+  const changed=new Map(),now=quoteNow();
+  if(now===null)return;
   for(const [symbol,data] of Object.entries(quotes)){
     if(!Array.isArray(data)||data.length<4)continue;
     const row=bySymbol.get(symbol);
     if(!row)continue;
     const [p,ch,v,t]=data.map(Number);
-    if(![p,ch,v,t].every(Number.isFinite)||p<=0||v<0||now-t< -5||now-t>=120)continue;
-    if(row.quote_updated_at&&row.quote_updated_at>t)continue;
+    if(![p,ch,v,t].every(Number.isFinite)||p<=0||v<0||now-t<0||now-t>=120)continue;
+    if(quoteStamp(row.quote_updated_at)>t)continue;
     row.quote_updated_at=t;
     row.price=p;row.change_pct=ch;row.quote_volume=v;
     changed.set(symbol,row);
@@ -128,15 +152,15 @@ function applyQuoteChanges(quotes){
       if(tr.cells.length<4)continue;
       const sym=tr.cells[0].textContent.trim(),r=changed.get(sym);
       if(!r)continue;
-      tr.cells[1].textContent=price(r.price);
+      paintQuoteCell(tr.cells[1],r);
       tr.cells[2].textContent=pct(r.change_pct);
       tr.cells[2].className=r.change_pct>=0?'positive':'negative';
       tr.cells[3].textContent=abbr(r.quote_volume);
     }
   }
   const chosen=changed.get(state.selected);
-  if(chosen&&state.page==='details')setText('selectedLivePrice','Canlı fiyat: '+price(chosen.price));
-  markQuoteConnection('Canlı fiyat · '+new Date().toLocaleTimeString('tr-TR',{hour:'2-digit',minute:'2-digit',second:'2-digit'}));
+  if(chosen&&state.page==='details')setText('selectedLivePrice','Son fiyat: '+price(chosen.price)+' · '+quoteLabel(chosen));
+  markQuoteConnection('Fiyat akışı bağlı · güncellik coin bazında gösterilir');
 }
 function connectPriceStream(){
   if(document.hidden||quoteSocket&&quoteSocket.readyState<=WebSocket.OPEN)return;
@@ -148,6 +172,7 @@ function connectPriceStream(){
   socket.onopen=()=>{reconnectMs=1500;lastQuoteMessage=Date.now();markQuoteConnection('Fiyat akışı bağlandı')};
   socket.onmessage=event=>{
     let msg;try{msg=JSON.parse(event.data)}catch{return}
+    syncServerClock(msg.server_time);
     lastQuoteMessage=Date.now();
     if(msg.type==='quotes')applyQuoteChanges(msg.quotes);
     else if(msg.type==='heartbeat'&&msg.source!=='WebSocket: Bağlandı')markQuoteConnection('Piyasa bağlantısı bekleniyor');
@@ -166,7 +191,7 @@ async function lightPriceFallback(){
   if(document.hidden||fallbackInFlight)return;
   if(quoteSocket?.readyState===WebSocket.OPEN&&Date.now()-lastQuoteMessage<15000)return;
   fallbackInFlight=true;
-  try{const data=await api('/api/prices');if(data.type==='quotes')applyQuoteChanges(data.quotes)}
+  try{const data=await api('/api/prices');syncServerClock(data.server_time);if(data.type==='quotes')applyQuoteChanges(data.quotes)}
   catch{markQuoteConnection('Güncel fiyat bağlantısı bekleniyor')}
   finally{fallbackInFlight=false}
 }
@@ -175,6 +200,7 @@ document.addEventListener('visibilitychange',()=>{
   else{connectPriceStream();refreshAll()}
 });
 setInterval(lightPriceFallback,5000);
+setInterval(()=>{if(!document.hidden)refreshQuoteAges()},1000);
 let searchTimer=null;
 async function loadOpportunities(){
   const panel=$('quickPlanRows');if(!panel)return;
@@ -278,7 +304,7 @@ async function loadQuality(){
     setText('qualityDecisions',n(d.decisions,0));setText('qualityApproved',`${d.approved_decisions||0} / ${d.blocked_candidates||0}`);
     setText('qualityExits',`${d.tp_today||0} / ${d.sl_today||0}`);setText('qualityFunding',n(r.funding?.pending_results||0,0));
     setText('qualityNet',d.mean_net_closed_today==null?'—':pct(d.mean_net_closed_today*100));setText('qualityLossRun',n(d.max_negative_sequence_today||0,0));
-    $('qualityReasons').replaceChildren(...(d.veto_reasons||[]).map(x=>elem('p',{},`${x.count} karar · ${x.reason}`)));
+    $('qualityReasons').replaceChildren(elem('p',{},'Günlük geçmiş kayıtlarıdır; anlık bağlantı arızası veya güncel coin sayısı değildir.'),...(d.veto_reasons||[]).map(x=>elem('p',{},`${x.count} karar · ${x.reason}`)));
     if(!(d.veto_reasons||[]).length)setText('qualityReasons','Henüz engellenen yön adayı kaydı yok. BEKLE kararları ayrıca sayılır.');
     setText('qualityModels',`Profesyonel eğitim: ${m.professional_trained||0}/${m.eligible||0} · LONG onaylı: ${m.approved_long||0} · SHORT onaylı: ${m.approved_short||0} · Gerçek geçmiş hedefi ${n(m.history_target||18000,0)} mum · Funding veri hatası: ${r.funding?.last_error||'yok'}`);
     setText('qualityCalibration',`${c.status||'ÖRNEK AZ'} · 24s içinde çözülen: ${c.resolved_within_24h||0} · Çözülmeyen / geç kapanan: ${c.censored_24h||0} · Veri eksik: ${c.unverified||0} · Henüz 24s dolmayan: ${c.immature||0} · Brier ${n(c.brier,4)} · ECE ${n(c.ece,4)}`);
@@ -292,7 +318,7 @@ async function loadQuality(){
 function paintHistory(items){let t=$('historyRows');t.replaceChildren();if(!items.length){let tr=elem('tr');tr.append(elem('td',{colspan:'5',className:'placeholder'},'Modelin kaydedilmiş sinyali henüz yok.'));t.append(tr);return}
  for(let i of items){let tr=elem('tr');tr.append(elem('td',{},dt(i.candle_time)),(()=>{let td=elem('td');td.append(signalTag(i.signal));return td})(),elem('td',{},prob(i.confidence)),elem('td',{},price(i.entry_reference)),elem('td',{className:'muted'},i.model_version));t.append(tr)}
 }
-async function loadDetail(){let nonce=++state.detailNonce;const s=state.selected,tf=state.period;setText('detailTitle',s);setText('chartCoin',s+' · '+tf);setText('selectedLivePrice','Canlı fiyat: '+price(state.rows.find(r=>r.symbol===s)?.price));$('symbolSelect').value=s;setText('chartCaption','Gerçek Binance '+tf+' mum grafiği');
+async function loadDetail(){let nonce=++state.detailNonce;const s=state.selected,tf=state.period;setText('detailTitle',s);setText('chartCoin',s+' · '+tf);refreshQuoteAges();$('symbolSelect').value=s;setText('chartCaption','Gerçek Binance '+tf+' mum grafiği');
   try{let [detail,chart]=await Promise.all([api('/api/symbol/'+encodeURIComponent(s)),api('/api/candles/'+encodeURIComponent(s)+'?'+new URLSearchParams({interval:tf,limit:'100'}))]);if(nonce!==state.detailNonce)return;paintPrediction(detail.prediction,detail.unified);paintHoldoutAudit(detail.directional_holdout);paintHistory(detail.history||[]);setText('chartSource',chart.source||'Binance REST');renderChart(chart.candles||[])}catch(e){if(nonce!==state.detailNonce)return;$('chartContainer').replaceChildren(elem('div',{className:'placeholder'},'Gerçek grafik alınamıyor: '+e.message));paintPrediction(null);paintHoldoutAudit({});paintHistory([])}
 }
 // Static SVG candlestick renderer, uses only real OHLC series from the server.
