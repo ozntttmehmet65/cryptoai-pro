@@ -44,7 +44,9 @@ def professional_audit(actions, outcomes, atrs, times, direction, tp, sl, regime
         if a==direction and int(times[i])-last>=DAY_MS:
             selected.append(i);last=int(times[i])
     resolved=[i for i in selected if outcomes[i] in (-1,1)]
-    wins=sum(outcomes[i]==1 for i in resolved)
+    # Training supplies NumPy arrays; native scalars keep the metadata JSON
+    # serializable even when a real direction has selected holdout candidates.
+    wins=int(sum(outcomes[i]==1 for i in resolved))
     n=len(resolved)
     returns=[(tp if outcomes[i]==1 else -sl)*float(atrs[i])-.004 for i in resolved]
     # Conservative common null: exceed the WORST stressed break-even across
@@ -55,7 +57,7 @@ def professional_audit(actions, outcomes, atrs, times, direction, tp, sl, regime
         p=sum(math.comb(n,k)*null**k*(1-null)**(n-k) for k in range(wins,n+1))
     adjusted=min(1., p*FAMILY_TESTS) if p is not None else None
     z=NormalDist().inv_cdf(1-FAMILY_ALPHA/FAMILY_TESTS)
-    lower=wilson_lower(wins,n,z) if n else None
+    lower=float(wilson_lower(wins,n,z)) if n else None
     thirds=[]
     for part in range(3):
         start=len(actions)*part//3;end=len(actions)*(part+1)//3
