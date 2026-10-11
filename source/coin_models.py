@@ -27,6 +27,7 @@ from ml_engine import (features, COLS, CLASSES, INTERVAL_MS,
                        EVALUATION_BARS, ROUND_TRIP_COST,
                        SIGNAL_THRESHOLD)
 from quality_guard import model_permissions, tp_sl_direction_metrics
+from holdout_audit import audit as holdout_audit
 from technical_analysis import setup_arrays, technical_scan
 from risk_plan import choose_on_train, entry_guidance, FALLBACK, ASSUMED_STRESS_COST
 from symbol_utils import symbol_valid, symbol_file_key
@@ -297,6 +298,7 @@ class CoinModelRegistry:
             br=risk_plan[direction]
             stressed = [(br['tp_atr'] if outcomes[i,0 if sign==1 else 1]==1 else -br['sl_atr'])*float(atrs[i])
                         - STRESS_ROUND_TRIP_COST for i in resolved]
+            validation[direction]["holdout_audit"] = holdout_audit(actions, outcomes[:,0 if sign==1 else 1], atrs, test_times, sign, br["tp_atr"], br["sl_atr"], test_probs[direction])
             detail = model_comparison[direction]
             permitted = bool(detail.get("beat_baseline"))
             validation[direction]["validation_outperformed_baseline"] = permitted
@@ -374,7 +376,7 @@ class CoinModelRegistry:
         date = datetime.now(timezone.utc)
         version = date.strftime("coin-%Y%m%dT%H%M%SZ") + "-" + symbol + "-v60"
         info = {
-            "symbol": symbol, "version":version, "model_family":MODEL_FAMILY,
+            "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":2,
             "algorithm":"Per-direction logistic/gradient booster + training-frozen TP/SL grid and validation Brier shrinkage",
             "trained_at":date.isoformat(), "train_samples":len(train),
             "validation_samples":len(valid), "test_samples":len(test),
@@ -398,12 +400,13 @@ class CoinModelRegistry:
         file_key = symbol_file_key(symbol)
         tmp_model = self.directory / f".{file_key}.tmp.joblib"
         tmp_info = self.directory / f".{file_key}.tmp.json"
-        joblib.dump({"models":models,"calibration":calibrations},tmp_model,compress=2)
+        payload={"models":models,"calibration":calibrations,"version":version,"model_family":MODEL_FAMILY}
+        joblib.dump(payload,tmp_model,compress=2)
         tmp_info.write_text(json.dumps(info,ensure_ascii=False,indent=2),encoding="utf-8")
         os.replace(tmp_model,artifact)
         os.replace(tmp_info,meta_path)
         self.metadata[symbol] = info
-        self.cache[symbol] = {"models":models,"calibration":calibrations}
+        self.cache[symbol] = payload
         self.cache.move_to_end(symbol)
         while len(self.cache)>self.max_in_memory:
             self.cache.popitem(last=False)
@@ -419,6 +422,10 @@ class CoinModelRegistry:
             # Only locally generated and persisted joblib files are loaded;
             # never untrusted user model uploads.
             model = joblib.load(self._artifact_path(symbol))
+            info=self.info(symbol) or {}
+            if info.get("artifact_schema")==2 and (not isinstance(model,dict) or model.get("version")!=info.get("version") or model.get("model_family")!=MODEL_FAMILY):
+                LOG.warning("Model and metadata version mismatch: %s",symbol)
+                return None
             self.cache[symbol] = model
             while len(self.cache) > self.max_in_memory:
                 self.cache.popitem(last=False)
@@ -442,7 +449,7 @@ class CoinModelRegistry:
                for i in range(len(closed)-79,len(closed))):
             return None
         frame = features(closed[-500:])
-        if frame.empty:
+        if frame.empty or int(frame.iloc[-1]["time"])!=int(closed[-1]["time"]):
             return None
         last = frame.iloc[-1]
         technical = technical_scan(frame)
