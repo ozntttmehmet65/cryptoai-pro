@@ -41,7 +41,7 @@ def setup(db: sqlite3.Connection):
     cols = {r[1] for r in db.execute('PRAGMA table_info(paper_observations)')}
     extra = {'settlement_method': "TEXT NOT NULL DEFAULT 'legacy_close_bar_60m'",
              'stop_price': 'REAL', 'target_price': 'REAL',
-             'exit_reason': 'TEXT', 'last_quote_ms': 'INTEGER'}
+             'exit_reason': 'TEXT', 'last_quote_ms': 'INTEGER', 'entry_policy': "TEXT NOT NULL DEFAULT 'pre_V7'"}
     for col, definition in extra.items():
         if col not in cols:
             db.execute(f'ALTER TABLE paper_observations ADD COLUMN {col} {definition}')
@@ -95,17 +95,19 @@ def observe(db, symbol: str, signal: dict, observed_price: float | None,
     # Do not let such old records permanently block a new TP/SL observation.
     if db.execute("""SELECT 1 FROM paper_observations
                      WHERE symbol=? AND state='OPEN'
-                       AND settlement_method IN (?,?) LIMIT 1""",
-                  (symbol, METHOD, SHADOW_METHOD)).fetchone():
+                       AND settlement_method=? LIMIT 1""",
+                  (symbol, SHADOW_METHOD if shadow else METHOD)).fetchone():
         return False
+    if shadow:model_version += "-shadow-v7"
     stop,target=bracket
     before=db.total_changes
     db.execute('''INSERT OR IGNORE INTO paper_observations
         (symbol,candle_time,model_version,signal,confidence,observed_at,
-         entry_price,settlement_method,stop_price,target_price,last_quote_ms)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)''',
+         entry_price,settlement_method,stop_price,target_price,last_quote_ms,entry_policy)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
        (symbol,candle_time,model_version,side,confidence,observed_ms,
-        entry,SHADOW_METHOD if shadow else METHOD,stop,target,observed_ms))
+        entry,SHADOW_METHOD if shadow else METHOD,stop,target,observed_ms,
+        (signal.get("execution_quality") or {}).get("policy_version","pre_V7")))
     db.commit()
     return db.total_changes>before
 
@@ -231,7 +233,14 @@ def report(db,limit=100):
                            WHERE settlement_method=? AND state='CLOSED' AND exit_reason='SL' ''',(SHADOW_METHOD,)).fetchone()[0]
     shadow_unverified=db.execute('''SELECT COUNT(*) FROM paper_observations
                            WHERE settlement_method=? AND state='VERI_EKSIK' ''',(SHADOW_METHOD,)).fetchone()[0]
-    return {'directional':directional_report(db), 'summary':{'observed':total,'settled':closed,'winning':winning,
+    policy_rows=db.execute("SELECT entry_policy,state,COUNT(*),SUM(CASE WHEN exit_reason='TP' THEN 1 ELSE 0 END) FROM paper_observations WHERE settlement_method=? GROUP BY entry_policy,state",(METHOD,)).fetchall()
+    policy_summary={}
+    for policy,st,count,tp in policy_rows:
+        group=policy_summary.setdefault(policy,{'observed':0,'closed':0,'tp':0,'unverified':0})
+        group['observed']+=count
+        if st=='CLOSED':group['closed']+=count;group['tp']+=tp
+        if st=='VERI_EKSIK':group['unverified']+=count
+    return {'entry_policy_summary':policy_summary,'directional':directional_report(db), 'summary':{'observed':total,'settled':closed,'winning':winning,
                        'tp_count':tp_count,'sl_count':sl_count,
                        'win_rate':winning/closed if closed else None,
                        'tp_first_rate':tp_count/(tp_count+sl_count) if tp_count+sl_count else None,

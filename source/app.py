@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from binance_client import BinanceClient, BinanceError, BinanceRateLimited
 from archive_client import ArchiveClient, last_complete_month
-from market_stream import ticker_worker
+from market_stream import ticker_worker, parse_books, BOOK_URL, merge_ordered
 from live_candles import (kline_worker, selected_symbols, setup as setup_live,
                           store_bars, contiguous_recent, freshness_ok, seed_recent_rest)
 from paper_trade import setup as setup_paper, observe as observe_paper, settle as settle_paper, reconcile_quotes, report as paper_report
@@ -58,6 +58,7 @@ TRAINING_CACHE.mkdir(parents=True, exist_ok=True)
 
 universe: dict[str, dict] = {}
 tickers: dict[str, dict] = {}
+books: dict[str, dict] = {}
 signals: dict[str, dict] = {}
 status: dict[str, Any] = {"universe_updated": None, "tickers_updated": None,
                           "last_error": None, "model_training": False, "training_stage": "Başlatılmadı",
@@ -205,9 +206,9 @@ async def refresh_market():
 
 def _stream_prices(updates):
     # Merge changed symbols; global last update is not an assertion that all quotes are fresh.
-    for symbol, quote in updates.items():
-        tickers[symbol]=quote
-    status["tickers_updated"] = max(q["updated_at"] for q in updates.values())
+    updates = merge_ordered(tickers, updates)
+    if not updates:return
+    status["tickers_updated"] = max(status["tickers_updated"] or 0, max(q["updated_at"] for q in updates.values()))
     # Evaluate TP/SL at each incoming Binance ticker batch, not on the next
     # 15m candle or a 3-second polling timer. This remains observational only.
     try:
@@ -215,9 +216,20 @@ def _stream_prices(updates):
         if changed:
             _drift_cache.clear()
             log.info("TP/SL paper results updated: %s",changed)
+        now_ms=int(time.time()*1000)
+        for symbol, quote in updates.items():
+            pred=_active_prediction(symbol,now_ms)
+            if pred and pred.get("signal") in ("LONG","SHORT"):
+                observe_paper(db,symbol,pred,quote["price"],now_ms)
     except Exception as exc:
         log.warning("TP/SL ticker observation failed: %s",str(exc)[:180])
 
+
+def _stream_books(updates):
+    merge_ordered(books, updates)
+
+def _book_status(value):
+    status["book_source"] = "WebSocket: " + value
 
 def _stream_status(value):
     status["ticker_source"] = "WebSocket: " + value
@@ -326,20 +338,21 @@ async def history_warm_worker():
 
 _drift_cache = {}
 
-def _current_drift(side, now_ms):
-    cached = _drift_cache.get(side)
+def _current_drift(side, now_ms, symbol=None, version=None):
+    key=(side,symbol,version)
+    cached = _drift_cache.get(key)
     if cached and 0 <= now_ms - cached[0] < 1000:
         return cached[1]
-    value = live_drift_block(db, side, now_ms)[0]
-    _drift_cache[side] = (now_ms, value)
+    value = live_drift_block(db, side, now_ms, symbol, version)[0]
+    _drift_cache[key] = (now_ms, value)
     return value
 
 
 def _guard(symbol, pred, now_ms):
-    side = pred.get('signal')
+    side = pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal')
     permission = coin_engine.permissions(symbol).get(side, {}).get('approved', False)
     return guarded_prediction(pred, tickers.get(symbol), now_ms, permission,
-                              _current_drift(side, now_ms) if side in ('LONG', 'SHORT') else False)
+                              (_current_drift(side, now_ms) or _current_drift(side, now_ms, symbol, pred.get('model_version'))) if side in ('LONG', 'SHORT') else False, book=books.get(symbol))
 
 
 def _active_prediction(symbol, now_ms):
@@ -624,6 +637,7 @@ async def lifespan(app: FastAPI):
     tasks = [asyncio.create_task(market_worker()),
              asyncio.create_task(coin_training_worker()),
              asyncio.create_task(ticker_worker(lambda: set(universe), _stream_prices, _stream_status)),
+             asyncio.create_task(ticker_worker(lambda: set(universe), _stream_books, _book_status, url=BOOK_URL, parser=parse_books)),
              asyncio.create_task(kline_worker(_live_symbols, _on_kline_close, _kline_state)),
              asyncio.create_task(history_warm_worker()),
              asyncio.create_task(stream_signal_worker()),
@@ -665,6 +679,28 @@ def _unified_counts(now):
         if st!='BEKLE':
             stats['long' if unified['direction']=='LONG' else 'short']+=1
     return stats
+
+
+def _execution_monitor(now_ms):
+    from collections import Counter
+    fresh_books=sum(1 for sym in universe if sym in books and 0<=now_ms/1000-books[sym].get('updated_at',0)<12)
+    counts=Counter(); candidates=approved=0
+    for symbol in signals:
+        pred=_active_prediction(symbol,now_ms)
+        if not pred or pred.get('candidate_signal') not in ('LONG','SHORT'):continue
+        candidates+=1
+        audit=pred.get('execution_quality') or {}
+        if pred.get('signal') in ('LONG','SHORT') and audit.get('approved'):approved+=1
+        counts.update(set(audit.get('reasons') or []))
+    return {'policy_version':'V7.0','book_stream':status.get('book_source','Bekleniyor'),
+            'fresh_books':fresh_books,'total_symbols':len(universe),'active_candidates':candidates,
+            'entry_passed':approved,'veto_reasons':[{'reason':r,'count':n} for r,n in counts.most_common(8)],
+            'notice':'Anlık giriş kontrolü; sebepler aynı adayda birlikte bulunabilir. Üst kademe verisi tüm derinliği veya emir gerçekleşmesini kanıtlamaz.'}
+
+
+@app.get('/api/execution-monitor')
+async def execution_monitor():
+    return _execution_monitor(int(time.time()*1000))
 
 
 @app.get("/api/health")
@@ -720,7 +756,8 @@ async def health():
                                     and p.get("model_version")==coin_engine.version(symbol)
                                     and int(time.time()*1000)-p.get("candle_time",0)<45*60*1000)},
             "technical_feature_count":len(__import__('ml_engine').COLS),
-            "unified_scoring_version":"V6.2",
+            "unified_scoring_version":"V7.0",
+            "execution_monitor": _execution_monitor(int(now*1000)),
             "unified_counts": _unified_counts(now),
             "data_updated_at": datetime.fromtimestamp(status["tickers_updated"], tz=timezone.utc).isoformat() if status["tickers_updated"] else None}
 
@@ -858,7 +895,7 @@ async def opportunities(limit: int = Query(12, ge=1, le=50)):
                      'updated_at':pred.get('updated_at'),
                      'warning':'Birleşik puan TP kazanma olasılığı değildir; takip fırsatı işlem onayı değildir'})
     rows.sort(key=lambda x:(x['kind']=='İŞLEM SİNYALİ',x['unified']['score']),reverse=True)
-    return {'version':'V6.2','total':len(rows),'counts':counts,'rows':rows[:limit],
+    return {'version':'V7.0','total':len(rows),'counts':counts,'rows':rows[:limit],
             'notice':'AI + indikatör + formasyon + 1s/4s tek puan ve tek yön. TAKİP ET doğrulanmış işlem sinyali değildir. 0-100 puan TP başarı yüzdesi değildir.'}
 
 
@@ -923,6 +960,7 @@ async def symbol_detail(symbol: str):
     except sqlite3.Error:
         rows = []
     return {"symbol":symbol, "quote": tickers.get(symbol) if tickers.get(symbol) and time.time()-tickers[symbol].get("updated_at",0)<120 else None,
+            "directional_holdout":(coin_engine.info(symbol) or {}).get("directional_validation",{}),
             "prediction":prediction, "unified":combined_assessment(prediction), "history":[{"candle_time":r[0], "saved_at":r[1], "signal":r[2],
             "confidence":r[3], "entry_reference":r[4], "model_version":r[5]} for r in rows]}
 

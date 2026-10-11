@@ -114,13 +114,18 @@ def model_permissions(info: dict | None) -> dict:
     return result
 
 
-def live_drift_block(db, direction: str, now_ms: int) -> tuple[bool, dict]:
+def live_drift_block(db, direction: str, now_ms: int, symbol=None, model_version=None) -> tuple[bool, dict]:
     """Block a previously approved direction following poor *new-method* live paper results."""
-    rows = db.execute("""SELECT net_return FROM paper_observations
+    query = """SELECT net_return FROM paper_observations
            WHERE state='CLOSED' AND settlement_method='tp_sl_live_quote_v1'
-             AND signal=? AND result_at>=? ORDER BY result_at DESC LIMIT 50""",
-           (direction, now_ms - 6 * 3600 * 1000)).fetchall()
-    returns = [float(row[0]) for row in rows if row[0] is not None]
+             AND signal=? AND result_at>=?"""
+    params=[direction,now_ms-6*3600*1000]
+    if symbol is not None:
+        query+=' AND symbol=?';params.append(symbol)
+    if model_version is not None:
+        query+=' AND model_version=?';params.append(model_version)
+    rows=db.execute(query+' ORDER BY result_at DESC LIMIT 50',params).fetchall()
+    returns = [float(row[0]) for row in rows if row[0] is not None and math.isfinite(float(row[0]))]
     n = len(returns)
     recent = returns[:20]
     hits = sum(v > 0 for v in recent)
