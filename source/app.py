@@ -32,6 +32,7 @@ from unified_scoring import combined_assessment
 from coin_models import CoinModelRegistry, INFERENCE_HISTORY_BARS
 from symbol_utils import symbol_file_key
 from price_push import price_delta
+from quote_quality import quote_quality, quote_coverage, DISPLAY_QUOTE_AGE_SECONDS
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -75,6 +76,7 @@ status: dict[str, Any] = {"universe_updated": None, "tickers_updated": None,
                           "coin_last_failure": None, "coin_force_refresh": False,
                           "coin_failure_reasons": {}}
 train_lock = asyncio.Lock()
+inference_lock = asyncio.Lock()
 db = sqlite3.connect(str(DATA_DIR / "signals.sqlite"), check_same_thread=False)
 db.execute("PRAGMA journal_mode=WAL")
 db.execute("CREATE TABLE IF NOT EXISTS signals (symbol TEXT, candle_time INTEGER, saved_at INTEGER, signal TEXT, "
@@ -437,6 +439,13 @@ def _save_signal(symbol, inf, bars, now_ms, source):
     status["last_scan"] = utc_now()
 
 
+async def infer_async(symbol, candles):
+    # Serialize model inference, but never run pandas/sklearn on the network loop.
+    # SQLite and signal publication remain on the event-loop thread.
+    async with inference_lock:
+        return await asyncio.to_thread(coin_engine.infer, symbol, candles)
+
+
 async def stream_signal_worker():
     """REST-block independent inference on consecutive streamed/archive candles."""
     while True:
@@ -447,7 +456,7 @@ async def stream_signal_worker():
                 continue
             candles=contiguous_recent(db,symbol,INFERENCE_HISTORY_BARS,limit=INFERENCE_HISTORY_BARS)
             if not freshness_ok(candles):continue
-            result=coin_engine.infer(symbol,candles)
+            result=await infer_async(symbol,candles)
             if result is None:continue
             now_ms=int(time.time()*1000)
             # Do not emit a duplicated prediction for an already assessed candle.
@@ -575,7 +584,8 @@ async def scan_worker():
             bars = await client.klines(symbol, limit=INFERENCE_HISTORY_BARS+1)
             now_ms = int(time.time()*1000)
             settle_paper(db, symbol, bars, now_ms)
-            inf = coin_engine.infer(symbol,bars)
+            inf = await infer_async(symbol,bars)
+            now_ms = int(time.time()*1000)
             if inf is not None:
                 _save_signal(symbol, inf, bars, now_ms, "Binance REST kapanmış 15dk")
             pos += 1
@@ -862,7 +872,8 @@ async def signal_diagnostics():
 async def health():
     now = time.time()
     fresh = status["tickers_updated"] is not None and now - status["tickers_updated"] < 120
-    return {"provider": "Binance USDⓈ-M Futures (WebSocket tickers + REST candles + official archive)", "provider_ok": fresh,
+    return {"server_time":int(now*1000), "quote_freshness_version":"V7.3.1",
+            "provider": "Binance USDⓈ-M Futures (WebSocket tickers + REST candles + official archive)", "provider_ok": fresh,
             "model_ready": coin_engine.stats(universe)["professional_trained"] > 0,
             "model_training": status["model_training"],
             "training_stage": status["training_stage"], "last_error": status["last_error"],
@@ -877,10 +888,7 @@ async def health():
                  "pending_reasons": {sym: reason for sym, reason in status["coin_failure_reasons"].items()
                                       if sym in universe and not coin_engine.ready(sym)}},
             "symbol_count": len(universe),
-            "quote_coverage": {"fresh": sum(1 for sym in universe if sym in tickers
-                                      and 0 <= now - tickers[sym].get("updated_at", 0) < 120),
-                               "missing": sorted(sym for sym in universe if sym not in tickers
-                                      or not 0 <= now - tickers[sym].get("updated_at", 0) < 120)},
+            "quote_coverage": quote_coverage(universe, tickers, now),
             "scanned_symbols": len(signals),
             "scan_count": status["scan_count"], "last_scan": status["last_scan"],
             "binance_cooldown_seconds": client.cooldown_seconds,
@@ -959,6 +967,7 @@ async def stream_prices_to_browser(socket: WebSocket):
 @app.get("/api/markets")
 async def markets(search: str = "", signal: str = "HEPSI", sort: str = "volume",
                   limit: int = Query(1500, ge=1, le=2500)):
+    now = time.time()
     fresh = status["tickers_updated"] is not None and time.time()-status["tickers_updated"] < 120
     rows = []
     watching = set(_live_symbols())
@@ -966,7 +975,8 @@ async def markets(search: str = "", signal: str = "HEPSI", sort: str = "volume",
         if search and search.upper() not in sym:
             continue
         quote_candidate=tickers.get(sym, {})
-        quote = quote_candidate if fresh and time.time()-quote_candidate.get("updated_at",0)<120 else {}
+        quality = quote_quality(quote_candidate, now)
+        quote = quote_candidate if quality['age_seconds'] is not None and 0 <= quality['age_seconds'] < DISPLAY_QUOTE_AGE_SECONDS else {}
         active = _active_prediction(sym, int(time.time()*1000))
         row = {"symbol":sym, "base": entry["base"], "quote":entry["quote"],
                "price": quote.get("price"), "change_pct":quote.get("change_pct"),
@@ -980,6 +990,7 @@ async def markets(search: str = "", signal: str = "HEPSI", sort: str = "volume",
                "signal_generated_at": active.get("updated_at") if active else None,
                "candle_closed_at": datetime.fromtimestamp((active["candle_time"]+900000)/1000,tz=timezone.utc).isoformat() if active else None,
                "quote_updated_at": datetime.fromtimestamp(quote["updated_at"],tz=timezone.utc).isoformat() if quote else None,
+               "quote_quality":quality,
                "decision_reason": active.get("blocked_reason") if active else None,
                "technical":active.get("technical") if active else None,
                "unified": combined_assessment(active) if active else combined_assessment(None)}
@@ -1014,7 +1025,7 @@ async def markets(search: str = "", signal: str = "HEPSI", sort: str = "volume",
         rows.sort(key=lambda x: x["confidence"] if x["confidence"] is not None else -1, reverse=True)
     else:
         rows.sort(key=lambda x: x["quote_volume"] if x["quote_volume"] is not None else -1, reverse=True)
-    return {"total":len(rows), "rows":rows[:limit], "fresh":fresh,
+    return {"total":len(rows), "rows":rows[:limit], "fresh":fresh, "server_time":int(now*1000),
             "updated_at": datetime.fromtimestamp(status["tickers_updated"], tz=timezone.utc).isoformat() if status["tickers_updated"] else None}
 
 

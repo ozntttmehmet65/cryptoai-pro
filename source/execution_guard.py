@@ -1,8 +1,8 @@
 """Read-only entry checks. They may veto a model, never approve one."""
 from __future__ import annotations
 import math
+from quote_quality import quote_quality, MAX_QUOTE_AGE_SECONDS
 
-MAX_QUOTE_AGE_SECONDS = 10
 MAX_ENTRY_DELAY_MS = 900_000
 MAX_REFERENCE_DEPARTURE_ATR = 0.35
 ASSUMED_COST = 0.0016
@@ -20,6 +20,13 @@ def entry_check(pred, quote, now_ms, book=None):
     def verify(key, label, passed):
         checks.append({"id":key, "label":label, "passed":bool(passed)})
         if not passed:reasons.append(label)
+    quality = quote_quality(quote, now_ms/1000)
+    quote_labels = {'missing':'Canlı fiyat henüz alınmadı',
+                    'invalid':'Canlı fiyat veya zaman damgası geçersiz',
+                    'future':'Fiyat zaman damgası sunucu saatinden ileride',
+                    'stale':'Son fiyat 10 saniye veya daha eski; yeni fiyat bekleniyor',
+                    'fresh':'Fiyat güncel (10 saniyeden yeni)'}
+    verify('quote', quote_labels[quality['status']], quality['fresh'])
     try:
         price, stamp = float(quote['price']), float(quote['updated_at'])
         reference, atr_pct = float(pred['entry_reference']), float(pred['risk_atr_pct'])
@@ -29,8 +36,6 @@ def entry_check(pred, quote, now_ms, book=None):
             raise ValueError('non-finite')
         if not (price > 0 and reference > 0 and 0 < atr_pct < .30 and 0 < tp <= 6 and 0 < sl <= 6):
             raise ValueError('invalid bracket')
-        age = now_ms/1000 - stamp
-        verify('quote', 'Canlı fiyat eski veya zaman damgası geçersiz', 0 <= age < MAX_QUOTE_AGE_SECONDS)
         verify('candle', 'Mum kapanışından sonra giriş penceresi doldu veya mum henüz kapanmadı', 0 <= now_ms - (candle + 900_000) <= MAX_ENTRY_DELAY_MS)
         departure = abs(price/reference - 1)/atr_pct
         verify('departure', 'Fiyat referans girişten 0,35 ATR uzaklaştı; yeni mum bekleniyor', departure <= MAX_REFERENCE_DEPARTURE_ATR)
@@ -65,6 +70,7 @@ def entry_check(pred, quote, now_ms, book=None):
         return value if value is None or math.isfinite(value) else None
     departure,net_reward,risk_reward,spread_bps,top_notional,break_even=map(finite,(departure,net_reward,risk_reward,spread_bps,top_notional,break_even))
     return {'approved': not reasons, 'reasons': reasons, 'checks':checks, 'policy_version':POLICY_VERSION,
+            'quote_quality':quality,
             'spread_bps':spread_bps, 'min_top_notional_usdt':top_notional,
             'conditional_stress_break_even':break_even,
             'assumptions':{'max_spread_bps':MAX_SPREAD_BPS,'min_top_notional_usdt':MIN_TOP_NOTIONAL,'stress_total_cost':STRESS_COST},
