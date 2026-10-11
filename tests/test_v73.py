@@ -12,6 +12,10 @@ from professional import POLICY
 from ml_engine import features, COLS
 from execution_guard import guarded_prediction
 from test_v62 import prediction, quote, book, NOW
+from coin_models import TRAINING_PIPELINE_VERSION
+from datetime import datetime, timezone
+import asyncio
+from types import SimpleNamespace
 
 
 def candles(n=4500):
@@ -152,6 +156,89 @@ class ModelTests(unittest.TestCase):
             self.assertFalse(fresh.training_due('BTCUSDT', now=__import__('time').time()))
             fresh.metadata['BTCUSDT'].pop('training_pipeline_version')
             self.assertTrue(fresh.training_due('BTCUSDT'))
+
+
+class MigrationTests(unittest.TestCase):
+    def current_info(self):
+        return dict(model_family=MODEL_FAMILY, ensemble_policy=ENSEMBLE_POLICY,
+                    professional_policy=POLICY, artifact_schema=3,
+                    training_pipeline_version=TRAINING_PIPELINE_VERSION,
+                    trained_at=datetime.now(timezone.utc).isoformat(),
+                    decision_policy=dict(version='validation_threshold_v1', threshold=.65,
+                        direction_margin=.10, chosen_on='chronological_validation_only',
+                        frozen_before_holdout=True, validation_passed={'LONG': False, 'SHORT': False}))
+
+    def test_old_professional_model_is_not_counted_as_repaired(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = CoinModelRegistry(tmp)
+            for symbol in ('BTCUSDT', 'ETHUSDT'):
+                r.metadata[symbol] = self.current_info()
+                r._artifact_path(symbol).touch()
+            r.metadata['BTCUSDT'].pop('training_pipeline_version')
+            r.metadata['BTCUSDT']['artifact_schema'] = 2
+            self.assertTrue(r.professional_ready('BTCUSDT'))
+            self.assertTrue(r.training_due('BTCUSDT'))
+            self.assertFalse(r.pipeline_ready('BTCUSDT'))
+            stats = r.stats(['BTCUSDT', 'ETHUSDT', 'CTUSDT'])
+            self.assertEqual(stats['professional_trained'], 2)
+            self.assertEqual(stats['pipeline_trained'], 1)
+            self.assertEqual(stats['pipeline_pending'], 2)
+            self.assertEqual(stats['approved_long'], 0)
+            self.assertEqual(stats['approved_short'], 0)
+
+    def test_invalid_current_policy_is_due_for_repair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = CoinModelRegistry(tmp)
+            r.metadata['BTCUSDT'] = self.current_info()
+            r._artifact_path('BTCUSDT').touch()
+            self.assertFalse(r.training_due('BTCUSDT'))
+            for schema in (2, None, '3'):
+                r.metadata['BTCUSDT']['artifact_schema'] = schema
+                self.assertFalse(r.pipeline_ready('BTCUSDT'))
+                self.assertTrue(r.training_due('BTCUSDT'))
+            r.metadata['BTCUSDT']['artifact_schema'] = 3
+            r.metadata['BTCUSDT']['decision_policy']['chosen_on'] = 'holdout'
+            self.assertFalse(r.pipeline_ready('BTCUSDT'))
+            self.assertTrue(r.training_due('BTCUSDT'))
+
+    def test_worker_migrates_liquid_old_professional_models_without_failed_coin_starvation(self):
+        import app as a
+        with tempfile.TemporaryDirectory() as tmp:
+            r = CoinModelRegistry(tmp)
+            for symbol in ('BTCUSDT', 'ETHUSDT', 'SOLUSDT'):
+                r.metadata[symbol] = self.current_info()
+                r._artifact_path(symbol).touch()
+            for symbol in ('BTCUSDT', 'ETHUSDT'):
+                r.metadata[symbol].pop('training_pipeline_version')
+            # SOL is already repaired, but volume alone would put it first.
+            volumes = dict(SOLUSDT=1000, CTUSDT=900, BTCUSDT=800, ETHUSDT=700, NEOUSDT=100)
+            calls = []
+            async def history(symbol):
+                calls.append(symbol)
+                if symbol == 'CTUSDT':
+                    raise ValueError('Purged chronological split too short')
+                return []
+            def fit(symbol, bars):
+                return dict(version='test-v73', trained_at=datetime.now(timezone.utc).isoformat())
+            async def paced_sleep(delay):
+                if delay == 180:
+                    raise asyncio.CancelledError()
+            state = dict(a.status)
+            state.update(coin_force_refresh=False, coin_training_success=0,
+                         coin_training_failed=0, coin_failure_reasons={})
+            with patch.object(a, 'coin_engine', r), patch.object(a, 'universe', set(volumes)), \
+                 patch.object(a, 'tickers', {s: {'quote_volume': v} for s, v in volumes.items()}), \
+                 patch.object(a, 'status', state), patch.object(a, 'COIN_AUTO_TRAIN', True), \
+                 patch.object(a, 'client', SimpleNamespace(cooldown_seconds=0)), \
+                 patch.object(a, '_training_bars', side_effect=history), patch.object(r, 'fit', side_effect=fit), \
+                 patch.object(a, 'store_bars'), patch.object(a, 'contiguous_recent', return_value=[]), \
+                 patch.object(a, 'freshness_ok', return_value=False), patch('app.asyncio.sleep', side_effect=paced_sleep):
+                with self.assertRaises(asyncio.CancelledError):
+                    asyncio.run(a.coin_training_worker())
+            self.assertEqual(calls, ['CTUSDT', 'BTCUSDT', 'ETHUSDT', 'NEOUSDT'])
+            self.assertEqual(state['coin_training_success'], 3)
+            self.assertEqual(state['coin_training_failed'], 1)
+            self.assertIn('CTUSDT', state['coin_failure_reasons'])
 
 
 if __name__ == '__main__':
