@@ -1,4 +1,4 @@
-# CryptoAI Pro V6.2
+# CryptoAI Pro V7.0
 
 Read-only Binance futures analysis and forward paper observations. No exchange orders are sent.
 
@@ -24,3 +24,13 @@ DATA_DIR=/path/to/persistent/data uvicorn app:app --host 0.0.0.0 --port 10000 --
 ```
 
 The existing Render Docker service can deploy this repository without a new service or disk. Keep its existing persistent disk mount and environment variables. No production profit benchmark has been performed for the added entry veto; validate via forward observation before interpreting results as predictive improvement.
+
+## V7.0 execution policy and frozen diagnostics
+
+Adds a single public USD-M all-book-ticker WebSocket. Exchange event timestamps and book update IDs reject replayed/out-of-order records. All views and forward paper entry require a fresh best bid/ask (12s), spread <=8bps and <=0.10 ATR, and at least 1,000 USDT visible on EACH best level. These are predeclared conservative policy limits, not empirically optimized profit rules. Full depth, actual fills, order size, funding and liquidation are not measured.
+
+A conditional TP-score check compares the calibrated score with the 0.4% stressed round-trip assumption plus observed spread and a five-percentage-point margin. The underlying score is conditional on resolution inside 24 hours, not an unconditional real-world expected return. The shared gate can only veto; it cannot override model validation. Global direction and symbol/model-specific forward drift locks both apply. Quotes can recover an eligible entry inside its original window, without duplicating an approved observation. Shadow tracks have separate identities and cannot block an approved track. Entry-policy cohorts distinguish V7.0 observations from older results.
+
+New sequential model training additionally saves non-overlapping 24h candidate diagnostics, three frozen chronological test segments, reliability bins and calibration ECE. Unresolved independent candidates remain in the denominator; segments and bins are diagnostic and NEVER select parameters. Existing models remain usable under their original validation. New artifacts contain a version/family identifier checked against metadata; inference rejects an older feature row masquerading as the latest candle.
+
+18 regression tests plus a synthetic training/reload/inference integration check and eight local HTTP endpoints were verified. Synthetic fixtures are test data only and never production market evidence. No forward improvement claim is made; V7.0 needs new observations.
