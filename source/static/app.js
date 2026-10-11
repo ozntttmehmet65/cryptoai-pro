@@ -35,19 +35,20 @@ function paintHealth(h){state.health=h;let ready=h.provider_ok&&h.model_ready;
   const coins=h.coin_training||{};
   setText('heroStatus',h.binance_cooldown_seconds>0?'Binance REST beklemede':!h.provider_ok?'Veri bağlantısı yok':coins.current_symbol?'Coin eğitiliyor: '+coins.current_symbol:h.model_ready?'Coin bazlı AI aktif':'Coin modelleri hazırlanıyor');
   setText('heroStatusIcon',!h.provider_ok?'⚠':h.model_ready?'✦':'◌');
-  setChip('modelChip',h.model_ready,'COIN MODELİ: '+(coins.trained||0)+'/'+(coins.eligible||h.symbol_count||0));
+  setChip('modelChip',h.model_ready,'OY MODELİ: '+(coins.ensemble_trained||0)+'/'+(coins.eligible||h.symbol_count||0));
+  setText('ensembleCoverage',`Oylama eğitimi tamamlanan: ${coins.ensemble_trained||0}/${coins.eligible||h.symbol_count||0} coin · Geçiş bekleyen: ${coins.ensemble_pending||0} · Her yönde 3 algoritma hedefi, en az 2 oy modeli. Uzlaşma ve bağımsız yön testi olmadan işlem sinyali verilmez.`);
   setText('statLong',String(h.unified_counts?.islem_sinyali??'—'));
   setText('statShort',String(h.unified_counts?.takip_et??'—'));
   setText('statTechLong',String(h.unified_counts?.long??'—'));
   setText('statTechShort',String(h.unified_counts?.short??'—'));
   setText('homeTechnical',`Birleşik sistem: ${h.unified_counts?.islem_sinyali||0} işlem onaylı · ${h.unified_counts?.takip_et||0} takip · ${h.unified_counts?.bekle||0} bekle`);
-  setText('homeTraining',`7/24 ayrı eğitim: ${coins.trained||0}/${coins.eligible||h.symbol_count||0} · LONG testli: ${coins.approved_long||0} · SHORT testli: ${coins.approved_short||0}`);
+  setText('homeTraining',`7/24 oylama eğitimi: ${coins.ensemble_trained||0}/${coins.eligible||h.symbol_count||0} · LONG testli: ${coins.approved_long||0} · SHORT testli: ${coins.approved_short||0}`);
   setText('homeFresh',h.binance_cooldown_seconds>0?(h.provider_ok?'WebSocket fiyatı var · REST beklemede':'REST beklemede: '+h.binance_cooldown_seconds+' sn'):h.provider_ok?'WebSocket piyasa verisi var':'Veri güncel değil');
   setText('updateTime',h.data_updated_at?(h.provider_ok?'Veri: ':'Eski veri: ')+dt(h.data_updated_at):'Güncelleme bekleniyor');
   setText('storageNotice',h.storage_persistent_configured?'Kalıcı disk ayarı bildirildi':'Kalıcı disk doğrulanmadı; yeniden başlatmada veriler kaybolabilir');
   setText('liveKlineState',h.kline_websocket||'Bekleniyor');
   setText('liveWatchCount',`${h.live_watch_count||0} / ${h.symbol_count||0} (hedef ${h.watch_target_count||0})`);
-  setText('warmupProgress',`Geçmiş mum hazır: ${h.daily_history_ready||0}/${h.watch_target_count||0} · Coin modeli eğitildi: ${coins.trained||0}/${coins.eligible||h.symbol_count||0} · Güncel AI kararları: ${h.signal_decisions_ready||0}/${h.symbol_count||0}`);
+  setText('warmupProgress',`Geçmiş mum hazır: ${h.daily_history_ready||0}/${h.watch_target_count||0} · Oylama modeli hazır: ${coins.ensemble_trained||0}/${coins.eligible||h.symbol_count||0} · Güncel AI kararları: ${h.signal_decisions_ready||0}/${h.symbol_count||0}`);
   setText('lastClosedBar',h.last_closed_kline_at?'Son kapanmış mum: '+dt(h.last_closed_kline_at):'Yeni mum kapanışı bekleniyor');
   $('sideConnection').replaceChildren(elem('span',{className:'dot '+(h.provider_ok?'green':'red')}),document.createTextNode(h.provider_ok?'Binance bağlantısı aktif':'Binance bağlantısı yok'));
   setError(h.binance_cooldown_seconds>0?'Binance REST engeli: '+h.binance_cooldown_seconds+' sn. REST taraması durdu; WebSocket kapanmış mumları birikiyor. Kesintisiz güncel mum geçmişi olmayan coinlerde sinyal verilmez.':!h.provider_ok?(h.last_error?'Binance veri bağlantısı: '+h.last_error:'Binance fiyatları alınamıyor. Veriler ve sinyaller canlı olarak sunulamaz.'):'');
@@ -205,10 +206,10 @@ async function loadOpportunities(){
 async function loadMarkets(){try{let params=new URLSearchParams({search:$('search').value.trim(),signal:$('signalFilter').value,sort:$('sortBy').value,limit:'2500'});let m=await api('/api/markets?'+params);paintMarkets(m);if(state.page==='overview'&&!m.fresh)setText('homeFresh','Veri güncel değil')}catch(e){setError('Piyasa listesi alınamadı: '+e.message)}}
 async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
   if(obj.scope==='independent_model_per_symbol'){
-    let x=obj.coin_training||{},total=x.eligible||0,trained=x.trained||0;
-    setText('homeVersion',`${trained}/${total} ayrı model`);
+    let x=obj.coin_training||{},total=x.eligible||0,trained=x.ensemble_trained||0;
+    setText('homeVersion',`${trained}/${total} oylama modeli`);
     setChip('modelTag',trained>0,`${trained}/${total} EĞİTİLDİ`);
-    setText('modelAlgo','Her coin için iki aday AI + ihtiyatlı olasılık kalibrasyonu');
+    setText('modelAlgo','Logistic + Gradient Boosting + Extra Trees · ağırlıklı oy');
     setText('modelVersion','Her coin için ayrı sürüm');
     setText('modelDate','Her coin için ayrı tarih');
     setText('modelDates','Uygun coinlerde 4.500 gerçek 15dk mum (yaklaşık 47 gün)');
@@ -217,7 +218,7 @@ async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
     setText('modelStage',obj.stage);
     setText('perfAccuracy','Coin bazında');setText('perfF1','Coin bazında');
     setText('perfTrades','Onaylı yönler');setText('perfDirectional','—');
-    setText('performanceCaution',`Her coin ayrı TP/SL yapay zekâ modeli: ${trained}/${total} eğitildi. Logistic ve GradientBoosting kıyaslanır; yüksek tahminler geçmiş başarıya göre kalibre edilir. Bağımsız TP/SL doğrulaması geçen LONG: ${x.approved_long||0}, SHORT: ${x.approved_short||0}. Yeterli kanıtı olmayan yönler BEKLE olur. Bunlar gerçek kâr garantisi değildir.`);
+    setText('performanceCaution',`Her coin ayrı TP/SL oylama modeli: ${trained}/${total} eğitildi. Üç algoritma hedeflenir; en az iki model birlikte oy verir. Ağırlıklar ve kalibrasyon doğrulama döneminden belirlenir. Yeterli uzlaşma yoksa BEKLE. Bağımsız TP/SL doğrulaması geçen LONG: ${x.approved_long||0}, SHORT: ${x.approved_short||0}. Yeterli kanıtı olmayan yönler BEKLE olur. Bunlar gerçek kâr garantisi değildir.`);
     setText('perfReturn','—');setText('perfCost','%0,16 varsayım');
     let pendingInfo = state.health?.coin_training?.pending_symbols||[];
     let failureInfo = state.health?.coin_training?.pending_reasons||{};
@@ -246,9 +247,10 @@ function paintPrediction(pred,unified){
   setText('pLong',u.long_score==null?'—':n(u.long_score,0)+'/100');setText('pShort',u.short_score==null?'—':n(u.short_score,0)+'/100');setText('pWait',u.status||'BEKLE');
   $('barLong').style.width=(u.long_score||0)+'%';$('barShort').style.width=(u.short_score||0)+'%';$('barWait').style.width=u.status==='BEKLE'?'100%':'0%';
   const c=u.components||{},tech=pred?.technical||{}, audit=pred?.execution_quality;
-  $('entryChecks').replaceChildren(...(audit?.checks||[]).map(c=>elem('span',{className:'chip '+(c.passed?'green':'amber')},`${({quote:'Fiyat',candle:'Mum',departure:'Giriş mesafesi',reward:'Maliyet',bracket:'TP/SL',book:'Alış/satış',spread:'Makas',liquidity:'Görünür tutar',executable:'Giriş fiyatı',stress:'Stres',model:'Model testi',drift:'Sonuç kilidi'})[c.id]||'Veri'} · ${c.passed?'GEÇTİ':'BEKLE'}`)));
+  $('entryChecks').replaceChildren(...(audit?.checks||[]).map(c=>elem('span',{className:'chip '+(c.passed?'green':'amber')},`${({quote:'Fiyat',candle:'Mum',departure:'Giriş mesafesi',reward:'Maliyet',bracket:'TP/SL',book:'Alış/satış',spread:'Makas',liquidity:'Görünür tutar',executable:'Giriş fiyatı',stress:'Stres',model:'Model testi',consensus:'Oy uzlaşması',drift:'Sonuç kilidi'})[c.id]||'Veri'} · ${c.passed?'GEÇTİ':'BEKLE'}`)));
   setText('entryAudit',audit?`Giriş denetimi: ${audit.approved?'GEÇTİ':'BEKLE'} · Makas ${n(audit.spread_bps,2)} bp · Görünür üst kademe ${n(audit.min_top_notional_usdt,0)} USDT · Referanstan uzaklık ${n(audit.reference_departure_atr,2)} ATR · Varsayılan maliyet sonrası ödül / risk ${n(audit.assumed_net_risk_reward,2)} · ${(audit.reasons||[]).join(' · ')}`:'Güncel giriş denetimi bekleniyor.');
-  setText('predTechnical',u.reason||'Birleşik değerlendirme bekleniyor');
+  const votes=pred?.ensemble; const voteText=votes?['LONG','SHORT'].map(side=>{const d=votes[side];return side+': '+(d?d.members.map(m=>`${m.name} ${prob(m.tp_score)} (ağırlık ${prob(m.weight)})`).join(' · ')+` · Uzlaşma ${d.agreement?'VAR':'YOK'}`:'oylama modeli yok')}).join(' | '):'Çoklu model eğitimi bekleniyor';
+  setText('modelVotes',voteText);
   setText('predTechnical',(u.reason||'Birleşik değerlendirme bekleniyor')+' · AI '+n(c.ai,1)+' + teknik '+n(c.indicators,1)+' + 1s/4s '+n(c.higher_timeframe,1)+' + formasyon '+n(c.patterns,1)+' + tarihsel teyit '+n(c.tested_setup,1)+' - stres cezası '+n(c.risk_penalty,1)+' puan. '+(u.matching_patterns||[]).join(', ')+' · Bu puan TP başarı olasılığı DEĞİLDİR.');
   setText('entry',price(u.entry_reference));setText('stop',price(u.sl_estimate));setText('target',price(u.tp_estimate));setText('candleDate',pred?dt(pred.candle_time):'—');
 }
@@ -283,8 +285,8 @@ function renderChart(candles){let holder=$('chartContainer');holder.replaceChild
 async function loadPaper(){
   try{const response=await api('/api/paper?limit=200'), summary=response.summary||{},rows=response.rows||[];
     if($('siteError').textContent.startsWith('Sanal gözlemler alınamadı:'))setError('');
-    const v7=response.entry_policy_summary?.['V7.0']||{};
-    setText('paperPolicyNote',`V7.0 giriş politikasıyla ${v7.observed||0} onaylı gözlem, ${v7.closed||0} kapanmış sonuç. Önceki sürümlerin kayıtları tarihsel kanıttır; V7.0 başarısı olarak yorumlanamaz.`);
+    const v7=response.entry_policy_summary?.['V7.1']||{};
+    setText('paperPolicyNote',`V7.1 giriş politikasıyla ${v7.observed||0} onaylı gözlem, ${v7.closed||0} kapanmış sonuç. Önceki sürümlerin kayıtları tarihsel kanıttır; V7.1 başarısı olarak yorumlanamaz.`);
     setText('paperTotal',n(summary.observed,0));setText('paperClosed',n(summary.settled,0));
     setText('paperWin',summary.win_rate===null?'—':pct(summary.win_rate*100));
     setText('paperAverage',summary.mean_net_return===null?'—':pct(summary.mean_net_return*100));

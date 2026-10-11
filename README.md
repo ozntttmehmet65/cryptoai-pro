@@ -1,4 +1,4 @@
-# CryptoAI Pro V7.0
+# CryptoAI Pro V7.1
 
 Read-only Binance futures analysis and forward paper observations. No exchange orders are sent.
 
@@ -31,6 +31,16 @@ Adds a single public USD-M all-book-ticker WebSocket. Exchange event timestamps 
 
 A conditional TP-score check compares the calibrated score with the 0.4% stressed round-trip assumption plus observed spread and a five-percentage-point margin. The underlying score is conditional on resolution inside 24 hours, not an unconditional real-world expected return. The shared gate can only veto; it cannot override model validation. Global direction and symbol/model-specific forward drift locks both apply. Quotes can recover an eligible entry inside its original window, without duplicating an approved observation. Shadow tracks have separate identities and cannot block an approved track. Entry-policy cohorts distinguish V7.0 observations from older results.
 
-New sequential model training additionally saves non-overlapping 24h candidate diagnostics, three frozen chronological test segments, reliability bins and calibration ECE. Unresolved independent candidates remain in the denominator; segments and bins are diagnostic and NEVER select parameters. Existing models remain usable under their original validation. New artifacts contain a version/family identifier checked against metadata; inference rejects an older feature row masquerading as the latest candle.
+New sequential model training additionally saves non-overlapping 24h candidate diagnostics, three frozen chronological test segments, reliability bins and calibration ECE. Unresolved independent candidates remain in the denominator; segments and bins are diagnostic and NEVER select parameters. In V7.0 existing models remained usable under their original validation; V7.1 requires migration to voting. New artifacts contain a version/family identifier checked against metadata; inference rejects an older feature row masquerading as the latest candle.
 
 18 regression tests plus a synthetic training/reload/inference integration check and eight local HTTP endpoints were verified. Synthetic fixtures are test data only and never production market evidence. No forward improvement claim is made; V7.0 needs new observations.
+
+## V7.1 main-system weighted voting
+
+Each coin and direction now trains LogisticRegression, HistGradientBoosting and a bounded 48-tree ExtraTrees classifier. All successfully trained members participate; at least two are required, with no single-model fallback. Fixed inverse validation-Brier weights (floor 0.05) and aggregate shrink calibration use validation data only. Holdout is never used to choose weights, thresholds or calibration.
+
+The frozen live AND holdout consensus policy requires at least two calibrated member scores >=0.60, their combined weight >=0.60 and maximum member-score spread <=0.20. The existing 0.65 directional decision and 0.10 opposite-direction gap remain. Probabilities remain visible for audit when consensus vetoes an entry. Validation, entry, liquidity and drift gates can only veto. New observation cohorts use V7.1; old results do not establish voting performance.
+
+On upgrade, old model records cannot supply live single-model predictions and are replaced as each voting ensemble trains; historical paper records remain. Sequential migration starts immediately regardless of old training age, prioritizes unconverted coins and exposes ensemble_trained / ensemble_pending counts. A failed refresh retains a previously valid ensemble; insufficient history remains pending. Runtime and dependencies stay on one CPU; no chat-model APIs or trading credentials added.
+
+V7.1 verification: 24 regression tests passed, including weighted vote arithmetic, consensus veto despite a high average, two-supporter requirement, malformed/single-member rejection, immediate legacy migration and policy mismatch rejection. A separate synthetic 3,000-bar integration fit both three-member heads, saved/reloaded them and inferred the current candle with finite JSON. Fixtures never become live market evidence.

@@ -10,7 +10,7 @@ STRESS_COST = 0.0040
 MAX_SPREAD_BPS = 8.0
 MAX_SPREAD_ATR_FRACTION = .10
 MIN_TOP_NOTIONAL = 1000.0
-POLICY_VERSION = "V7.0"
+POLICY_VERSION = "V7.1"
 
 
 def entry_check(pred, quote, now_ms, book=None):
@@ -79,6 +79,11 @@ def guarded_prediction(pred, quote, now_ms, permission, drift_blocked=False, *, 
     check = entry_check(pred, quote or {}, now_ms, book)
     side = pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal')
     if side in ('LONG', 'SHORT'):
+        if 'ensemble' in pred:
+            agreement = ((pred.get('ensemble') or {}).get(side) or {}).get('agreement') is True
+            check['checks'].append({'id':'consensus','passed':agreement,'label':'Çoklu model oy uzlaşması'})
+            if not agreement:
+                check['reasons'].append('Model oyları yeterince uzlaşmıyor; BEKLE')
         check['checks'].append({'id':'model','passed':bool(permission),'label':'Bağımsız model yön testi'})
         check['checks'].append({'id':'drift','passed':not drift_blocked,'label':'Canlı yön ve coin/model sonuç kilidi'})
         if not permission:

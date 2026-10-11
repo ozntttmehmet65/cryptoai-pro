@@ -549,7 +549,8 @@ async def coin_training_worker():
         if not COIN_AUTO_TRAIN or not universe:
             await asyncio.sleep(30)
             continue
-        symbols = sorted(universe, key=lambda s: tickers.get(s,{}).get("quote_volume",0),reverse=True)
+        symbols = sorted(universe, key=lambda s: (coin_engine.ensemble_ready(s),
+                         -tickers.get(s,{}).get("quote_volume",0)))
         force = bool(status["coin_force_refresh"])
         status["coin_force_refresh"] = False
         for symbol in symbols:
@@ -565,13 +566,13 @@ async def coin_training_worker():
             if now - last_attempt.get(symbol,0) < (COIN_RETRY_SECONDS if failures.get(symbol) else 600):
                 continue
             if client.cooldown_seconds:
-                status["training_stage"] = f"Binance dinlenme süresi · {client.cooldown_seconds} sn; mevcut modeller kullanılıyor"
+                status["training_stage"] = f"Binance dinlenme süresi · {client.cooldown_seconds} sn; oylama modelleri bekleniyor"
                 await asyncio.sleep(min(900,client.cooldown_seconds+1))
                 break  # Do not wait once PER COIN during a shared Binance ban.
             last_attempt[symbol] = now
             status["coin_training_current"] = symbol
             status["model_training"] = True
-            status["training_stage"] = f"7/24 coin bazli model egitimi: {symbol}"
+            status["training_stage"] = f"Çoklu model oylaması eğitiliyor: {symbol}"
             try:
                 bars = await _training_bars(symbol)
                 info = await asyncio.to_thread(coin_engine.fit, symbol, bars)
@@ -692,7 +693,7 @@ def _execution_monitor(now_ms):
         audit=pred.get('execution_quality') or {}
         if pred.get('signal') in ('LONG','SHORT') and audit.get('approved'):approved+=1
         counts.update(set(audit.get('reasons') or []))
-    return {'policy_version':'V7.0','book_stream':status.get('book_source','Bekleniyor'),
+    return {'policy_version':'V7.1','book_stream':status.get('book_source','Bekleniyor'),
             'fresh_books':fresh_books,'total_symbols':len(universe),'active_candidates':candidates,
             'entry_passed':approved,'veto_reasons':[{'reason':r,'count':n} for r,n in counts.most_common(8)],
             'notice':'Anlık giriş kontrolü; sebepler aynı adayda birlikte bulunabilir. Üst kademe verisi tüm derinliği veya emir gerçekleşmesini kanıtlamaz.'}
@@ -708,7 +709,7 @@ async def health():
     now = time.time()
     fresh = status["tickers_updated"] is not None and now - status["tickers_updated"] < 120
     return {"provider": "Binance USDⓈ-M Futures (WebSocket tickers + REST candles + official archive)", "provider_ok": fresh,
-            "model_ready": coin_engine.stats(universe)["trained"] > 0,
+            "model_ready": coin_engine.stats(universe)["ensemble_trained"] > 0,
             "model_training": status["model_training"],
             "training_stage": status["training_stage"], "last_error": status["last_error"],
             "coin_training": {**coin_engine.stats(universe), "enabled": COIN_AUTO_TRAIN,
@@ -756,7 +757,7 @@ async def health():
                                     and p.get("model_version")==coin_engine.version(symbol)
                                     and int(time.time()*1000)-p.get("candle_time",0)<45*60*1000)},
             "technical_feature_count":len(__import__('ml_engine').COLS),
-            "unified_scoring_version":"V7.0",
+            "unified_scoring_version":"V7.1",
             "execution_monitor": _execution_monitor(int(now*1000)),
             "unified_counts": _unified_counts(now),
             "data_updated_at": datetime.fromtimestamp(status["tickers_updated"], tz=timezone.utc).isoformat() if status["tickers_updated"] else None}
@@ -895,7 +896,7 @@ async def opportunities(limit: int = Query(12, ge=1, le=50)):
                      'updated_at':pred.get('updated_at'),
                      'warning':'Birleşik puan TP kazanma olasılığı değildir; takip fırsatı işlem onayı değildir'})
     rows.sort(key=lambda x:(x['kind']=='İŞLEM SİNYALİ',x['unified']['score']),reverse=True)
-    return {'version':'V7.0','total':len(rows),'counts':counts,'rows':rows[:limit],
+    return {'version':'V7.1','total':len(rows),'counts':counts,'rows':rows[:limit],
             'notice':'AI + indikatör + formasyon + 1s/4s tek puan ve tek yön. TAKİP ET doğrulanmış işlem sinyali değildir. 0-100 puan TP başarı yüzdesi değildir.'}
 
 
@@ -907,14 +908,14 @@ async def paper(limit: int = Query(100, ge=1, le=500)):
 
 @app.get("/api/model")
 async def model_info():
-    return {"ready": coin_engine.stats(universe)["trained"]>0,
+    return {"ready": coin_engine.stats(universe)["ensemble_trained"]>0,
             "training":status["model_training"], "stage":status["training_stage"],
             "scope":"independent_model_per_symbol",
             "coin_training":coin_engine.stats(universe),
             "legacy_global_model":{"exists":engine.model is not None,
                                   "version":(engine.info or {}).get("version"),
                                   "used_for_live_signals":False},
-            "notice":"V6.0: Her coin icin 4500 gercek 15dk mum hedefi; TP/SL katsayilari yalnizca purged TRAIN doneminde secilir ve kronolojik VALID/TEST ayridir. Canli sanal pozisyonun TP/SL'si egitimde secilen planla aynidir; belirli saate gore kapanmaz. Dogrulanmamis teknik adaylar AI islemi degildir. Eski modeller korunur; gercek emir yok."}
+            "notice":"V7.1 ana sistem: Her coin ve yön için LogisticRegression, HistGradientBoosting ve ExtraTrees ağırlıklı oylaması. En az iki model, iki destekleyen oy, en az %60 destek ağırlığı ve en fazla 20 puan farkı gerekir. Ağırlık ve kalibrasyon yalnızca VALID verisinden; test verisiyle ayarlanmaz. Eski tek model kayıtları oylama eğitilene kadar sinyal üretmez. TP/SL yalnızca TRAIN verisinden seçilir; gerçek emir yok."}
 
 
 @app.post("/api/admin/retrain")
@@ -931,6 +932,7 @@ async def coin_model_detail(symbol: str):
     if symbol not in universe:
         raise HTTPException(status_code=404,detail="Desteklenmeyen Futures sozlesmesi")
     return {"symbol":symbol, "trained":coin_engine.ready(symbol),
+            "ensemble_ready":coin_engine.ensemble_ready(symbol),
             "info":coin_engine.info(symbol), "directional_signal_permissions":coin_engine.permissions(symbol),
             "notice":"Tek basina egitim basarili sinyal veya kar garantisi degildir."}
 
@@ -944,6 +946,7 @@ async def coin_model_list(limit: int = Query(100, ge=1, le=1000)):
             p = coin_engine.permissions(sym)
             models.append({"symbol":sym,"version":info["version"], "trained_at":info["trained_at"],
                           "approved_long":p["LONG"]["approved"], "approved_short":p["SHORT"]["approved"],
+                          "ensemble_ready":coin_engine.ensemble_ready(sym),
                           "test_samples":info.get("test_samples")})
     return {"stats":coin_engine.stats(universe),"models":models[:limit],"total_models":len(models)}
 
