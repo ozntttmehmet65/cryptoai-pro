@@ -32,6 +32,10 @@ from holdout_audit import audit as holdout_audit
 from technical_analysis import setup_arrays, technical_scan
 from risk_plan import choose_on_train, entry_guidance, FALLBACK, ASSUMED_STRESS_COST
 from symbol_utils import symbol_valid, symbol_file_key
+from decision_policy import decide, select_policy, valid_policy
+
+INFERENCE_HISTORY_BARS = 1200
+TRAINING_PIPELINE_VERSION = "v73"
 from professional import POLICY as PROFESSIONAL_POLICY, HISTORY_TARGET, professional_audit, market_condition, market_regimes
 
 LOG = logging.getLogger(__name__)
@@ -114,6 +118,7 @@ class CoinModelRegistry:
         if (info.get('symbol')!=symbol or info.get('version')!=version or info.get('professional_policy')!=PROFESSIONAL_POLICY
             or payload.get('version')!=version or payload.get('professional_policy')!=PROFESSIONAL_POLICY
             or payload.get('model_family')!=MODEL_FAMILY or payload.get('ensemble_policy')!=ENSEMBLE_POLICY
+            or (info.get('artifact_schema',0)>=3 and (not valid_policy(info.get('decision_policy')) or payload.get('decision_policy')!=info.get('decision_policy')))
             or not 0<=time.time()-_time_of(info.get('trained_at'))<=24*3600
             or not any(p['approved'] for p in model_permissions(info).values())):
             raise ValueError('Rollback requires a current, verified professional model')
@@ -130,13 +135,19 @@ class CoinModelRegistry:
 
     def permissions(self, symbol):
         result = model_permissions(self.info(symbol))
-        if not self.ensemble_ready(symbol):
-            for side in result.values():
-                side.update(approved=False, reason="Çoklu model eğitimi bekleniyor; eski tek model ana sinyal üretmez")
-        info=self.info(symbol) or {}
-        if info.get('professional_policy')!=PROFESSIONAL_POLICY or not 0<=time.time()-_time_of(info.get('trained_at'))<=24*3600:
-            for side in result.values():
-                side.update(approved=False, reason="Profesyonel dönem / çoklu seçim testi veya güncel model kanıtı bekleniyor")
+        info = self.info(symbol) or {}
+        tests = (
+            ('ensemble_ready', 'Çoklu model eğitimi', self.ensemble_ready(symbol)),
+            ('professional_ready', 'Profesyonel model geçişi', info.get('professional_policy') == PROFESSIONAL_POLICY),
+            ('model_freshness', 'Model yaşı en fazla 24 saat', 0 <= time.time()-_time_of(info.get('trained_at')) <= 24*3600),
+        )
+        for permission in result.values():
+            for key, label, passed in tests:
+                permission.setdefault('checks', []).append(dict(id=key, label=label, actual=bool(passed), required=True, passed=bool(passed)))
+                if not passed:
+                    permission['approved'] = False
+                    permission.setdefault('failed_checks', []).append(key)
+                    permission['reason'] = (permission.get('reason') or '') + '; ' + label
         return result
 
     def ensemble_ready(self, symbol):
@@ -153,6 +164,8 @@ class CoinModelRegistry:
             return True
         if not self.professional_ready(symbol):
             return True  # Migrate immediately, even if the old model is recent.
+        if info.get("training_pipeline_version") != TRAINING_PIPELINE_VERSION:
+            return True
         # Last successful per-symbol training, not the global model's time.
         trained = _time_of(info.get("trained_at"))
         return now - trained >= interval_hours * 3600
@@ -176,14 +189,7 @@ class CoinModelRegistry:
     @staticmethod
     def decision(p_long, p_short):
         """Independent TP-first probabilities. Never treat these as a 3-class simplex."""
-        p_long = float(p_long) if p_long is not None else 0.0
-        p_short = float(p_short) if p_short is not None else 0.0
-        # If two incompatible directions are simultaneously credible, wait.
-        if p_long >= SIGNAL_THRESHOLD and p_long >= p_short + .10:
-            return "LONG", p_long
-        if p_short >= SIGNAL_THRESHOLD and p_short >= p_long + .10:
-            return "SHORT", p_short
-        return "BEKLE", 0.0
+        return decide(p_long, p_short)
 
     @staticmethod
     def _candidates():
@@ -324,6 +330,8 @@ class CoinModelRegistry:
         test_probs = {}
         test_agreement = {}
         calibrations = {}
+        validation_probs = {}
+        validation_agreement = {}
         for direction, col in (("LONG", "long_outcome"), ("SHORT", "short_outcome")):
             # An unresolved 24-hour window is CENSORED, not an SL and not
             # a manufactured TP. Contradictory same-bar highs/lows are excluded.
@@ -344,6 +352,8 @@ class CoinModelRegistry:
                 calibrations[direction] = None
                 test_probs[direction] = np.zeros(len(test))
                 test_agreement[direction] = np.zeros(len(test), dtype=bool)
+                validation_probs[direction] = np.zeros(len(valid))
+                validation_agreement[direction] = np.zeros(len(valid), dtype=bool)
                 continue
             x_tr = tr[COLS].to_numpy(dtype=float)
             x_va = va[COLS].to_numpy(dtype=float)
@@ -370,6 +380,8 @@ class CoinModelRegistry:
                 calibrations[direction] = None
                 test_probs[direction] = np.zeros(len(test))
                 test_agreement[direction] = np.zeros(len(test), dtype=bool)
+                validation_probs[direction] = np.zeros(len(valid))
+                validation_agreement[direction] = np.zeros(len(valid), dtype=bool)
                 comparison["reason"] = "At least two trained voting models are required"
                 continue
             # Fixed inverse-Brier weights use VALIDATION ONLY, never holdout.
@@ -392,15 +404,22 @@ class CoinModelRegistry:
                 raw_validation, va_y, baseline_rate)
             calibrations[direction] = calibration
             comparison["calibration"] = calibration
+            validation_probs[direction], validation_agreement[direction], _ = self.vote_details(
+                winner, calibration, valid[COLS].to_numpy(dtype=float))
+            comparison["calibrated_validation_brier"] = calibration.get("validation_calibrated_brier") if calibration else None
             test_probs[direction], test_agreement[direction], _ = self.vote_details(
                 winner, calibration, X_test)
         if all(model is None for model in models.values()):
             raise ValueError("No direction has sufficient resolved TP/SL events for training")
+        policy = select_policy(validation_probs["LONG"], validation_probs["SHORT"],
+                               valid[["long_outcome", "short_outcome"]].to_numpy(dtype=int),
+                               valid["atr_pct"].to_numpy(dtype=float),
+                               valid["time"].to_numpy(dtype=np.int64), risk_plan, validation_agreement)
         p_long = test_probs["LONG"]
         p_short = test_probs["SHORT"]
         actions = np.zeros(len(test),dtype=int)
         for i in range(len(test)):
-            d,_ = self.decision(p_long[i],p_short[i])
+            d,_ = decide(p_long[i],p_short[i],policy)
             if d in ("LONG", "SHORT") and not test_agreement[d][i]:
                 d = "BEKLE"
             actions[i] = 1 if d == "LONG" else -1 if d == "SHORT" else 0
@@ -501,9 +520,11 @@ class CoinModelRegistry:
                 "test_method":"fixed_score>=6.5; purged chronological unseen TP/SL first touch (24h censored)",
                 "notice":"Exploratory technical confirmation; historical correlation and multiple-comparison risk. Not guaranteed live P(TP)."}
         date = datetime.now(timezone.utc)
-        version = date.strftime("coin-%Y%m%dT%H%M%S%fZ") + "-" + symbol + "-v72"
+        version = date.strftime("coin-%Y%m%dT%H%M%S%fZ") + "-" + symbol + "-v73"
         info = {
-            "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":2,
+            "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":3,
+            "training_pipeline_version":TRAINING_PIPELINE_VERSION,"decision_policy":policy,
+            "inference_history_bars":INFERENCE_HISTORY_BARS,
             "algorithm":"Per-direction LogisticRegression + HistGradientBoosting + ExtraTrees weighted soft voting, validation-only calibration and fixed consensus veto",
             "ensemble_policy": ENSEMBLE_POLICY,
             "professional_policy":PROFESSIONAL_POLICY,
@@ -535,7 +556,7 @@ class CoinModelRegistry:
         tmp_model = self.directory / f".{file_key}.tmp.joblib"
         tmp_info = self.directory / f".{file_key}.tmp.json"
         payload={"models":models,"calibration":calibrations,"version":version,"model_family":MODEL_FAMILY,
-                 "ensemble_policy":ENSEMBLE_POLICY,"professional_policy":PROFESSIONAL_POLICY}
+                 "ensemble_policy":ENSEMBLE_POLICY,"professional_policy":PROFESSIONAL_POLICY,"decision_policy":policy}
         # Keep the candidate and previous champion as independent version files.
         # Promotion preserves every currently approved incumbent direction unless
         # the candidate also passes that direction. Comparing scores from different
@@ -588,8 +609,11 @@ class CoinModelRegistry:
             # never untrusted user model uploads.
             model = joblib.load(self._artifact_path(symbol))
             info=self.info(symbol) or {}
-            if (info.get("artifact_schema")==2 or isinstance(model,dict) and model.get("version")) and (not isinstance(model,dict) or model.get("version")!=info.get("version") or model.get("model_family")!=MODEL_FAMILY or model.get("ensemble_policy")!=info.get("ensemble_policy")):
+            if (info.get("artifact_schema",0)>=2 or isinstance(model,dict) and model.get("version")) and (not isinstance(model,dict) or model.get("version")!=info.get("version") or model.get("model_family")!=MODEL_FAMILY or model.get("ensemble_policy")!=info.get("ensemble_policy")):
                 LOG.warning("Model and metadata version mismatch: %s",symbol)
+                return None
+            if info.get("artifact_schema",0)>=3 and (not valid_policy(info.get("decision_policy")) or model.get("decision_policy")!=info.get("decision_policy")):
+                LOG.warning("Decision policy and artifact mismatch: %s",symbol)
                 return None
             self.cache[symbol] = model
             while len(self.cache) > self.max_in_memory:
@@ -610,12 +634,13 @@ class CoinModelRegistry:
             return None
         now_ms = now_ms or int(time.time()*1000)
         closed = sorted((c for c in candles if c["close_time"] < now_ms),key=lambda c:c["time"])
-        if len(closed)<80 or now_ms-closed[-1]["close_time"]>35*60*1000:
+        needed = INFERENCE_HISTORY_BARS
+        if len(closed)<needed or not 0 <= now_ms-closed[-1]["close_time"] <= 35*60*1000:
             return None
         if any(closed[i]["time"]-closed[i-1]["time"]!=INTERVAL_MS
-               for i in range(len(closed)-79,len(closed))):
+               for i in range(len(closed)-needed+1,len(closed))):
             return None
-        frame = features(closed[-500:])
+        frame = features(closed[-INFERENCE_HISTORY_BARS:])
         if frame.empty or int(frame.iloc[-1]["time"])!=int(closed[-1]["time"]):
             return None
         last = frame.iloc[-1]
@@ -635,7 +660,7 @@ class CoinModelRegistry:
         p_long, p_short = float(lp[0]), float(sp[0])
         voting = {"policy":ENSEMBLE_POLICY, "LONG":ld[0] if ld else None,
                   "SHORT":sd[0] if sd else None}
-        candidate, confidence = self.decision(p_long,p_short)
+        candidate, confidence = decide(p_long,p_short,info.get("decision_policy"))
         reason = None
         signal = candidate
         if signal in ("LONG", "SHORT") and not (la[0] if signal == "LONG" else sa[0]):
@@ -668,6 +693,8 @@ class CoinModelRegistry:
                 "ensemble":voting,
                 # LONG/SHORT scores are NOT a 3-class distribution.
                 "p_wait":None, "blocked_reason":reason,
+                "decision_policy":info.get("decision_policy"),
+                "inference_history_bars":min(len(closed), INFERENCE_HISTORY_BARS),
                 "candidate_signal":candidate if candidate != "BEKLE" else None,
                 "entry_reference":entry,
                 "stop_estimate":(entry-sl_mult*atr if signal=="LONG" else entry+sl_mult*atr if signal=="SHORT" else None),
