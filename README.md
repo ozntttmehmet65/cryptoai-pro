@@ -1,4 +1,44 @@
-# CryptoAI Pro V7.3
+# CryptoAI Pro V7.4
+
+## V7.4 signal pipeline and visible depth
+
+- BEKLE predictions without an AI candidate no longer lose their technical
+  watch status due to an execution veto. Their failed execution checks remain
+  visible; watch status never grants trade approval or an approved paper entry.
+- Separate score contributions from decision/entry reasons in the market
+  table. Both columns wrap on mobile. Show actual visible notional, ATR
+  displacement and limits rather than putting only veto text under "score".
+- Read fresh public depth20@500ms snapshots for at most 32 prioritized symbols
+  (approved open positions, AI candidates, technical watches, then volume).
+  Walk both sides for 100 USDT, require full visible size, cap additional
+  depth impact at 2 bps, and apply spread/stress/reference gates to the VWAP.
+  Snapshots expire at three seconds; untracked/stale-depth symbols retain the
+  fresh best-level gate. Paper entry uses the same VWAP; depth exits walk the
+  actual position quantity. Fee, extra slippage and funding assumptions remain.
+- LONG and SHORT now freeze separate thresholds on validation only from the
+  existing menu; a failed direction retains .65 and no permission. Each voting
+  member has its own validation-only shrink calibration instead of borrowing
+  the aggregate calibration. Independent holdout/professional gates remain.
+- Schema-4/v74 artifacts pair pipeline, version and frozen policy. Old models
+  remain available with their existing permissions; volume-prioritized
+  sequential migration starts automatically, preserving approved incumbents.
+- Successful bounded history paging continues on later training attempts
+  without a 24-hour lock. Exhausted history waits 24 hours; failed requests
+  wait one hour and preserve completed pages and the shared Binance cooldown.
+- Health diagnostics distinguish baseline-only models, validation with no
+  candidates, validation with no positive stressed result, and holdout with
+  no candidates. These overlapping model causes are not live liquidity vetoes.
+
+Validation: 81 Python regression/integration tests and two JavaScript UI
+regression checks passed, plus JavaScript syntax and whitespace checks.
+An authentic BTCUSDT depth20 message parsed and produced a 100 USDT VWAP.
+Synthetic checks establish implementation behavior, not market performance.
+Production models may still have zero approved directions: this release does
+not override failed evidence or promise an approved signal or profitable TP.
+
+Primary stream reference: the official Binance USD-M connector's
+`partial_book_depth_streams`, in
+https://github.com/binance/binance-connector-python/blob/master/clients/derivatives_trading_usds_futures/src/binance_sdk_derivatives_trading_usds_futures/websocket_streams/streams/public_api.py
 
 ## V7.3.2 entry liquidity / reference tolerance
 
