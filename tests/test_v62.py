@@ -166,7 +166,7 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(detail['unified']['status'],'İŞLEM SİNYALİ')
             self.assertEqual(asyncio.run(a.opportunities(limit=12))['total'],1)
             self.assertEqual(a._unified_counts(now)['islem_sinyali'],1)
-            self.assertEqual(a._execution_monitor(int(now*1000))['policy_version'],'V7.3.2')
+            self.assertEqual(a._execution_monitor(int(now*1000))['policy_version'],'V7.4')
             with patch.object(a,'_current_drift',return_value=True):
                 self.assertEqual(asyncio.run(a.symbol_detail('BTCUSDT'))['unified']['status'],'BEKLE')
 
