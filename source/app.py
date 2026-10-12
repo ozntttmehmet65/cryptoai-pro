@@ -27,6 +27,7 @@ import quality_report
 from professional import POLICY as PROFESSIONAL_POLICY, HISTORY_TARGET, correlation_groups
 from quality_guard import live_drift_block
 from execution_guard import guarded_prediction
+from execution_policy import POLICY_VERSION as ENTRY_POLICY_VERSION
 from ml_engine import ModelEngine
 from unified_scoring import combined_assessment
 from coin_models import CoinModelRegistry, INFERENCE_HISTORY_BARS
@@ -812,7 +813,7 @@ def _execution_monitor(now_ms):
         audit=pred.get('execution_quality') or {}
         if pred.get('signal') in ('LONG','SHORT') and audit.get('approved'):approved+=1
         counts.update(set(audit.get('reasons') or []))
-    return {'policy_version':'V7.2','book_stream':status.get('book_source','Bekleniyor'),
+    return {'policy_version':ENTRY_POLICY_VERSION,'book_stream':status.get('book_source','Bekleniyor'),
             'fresh_books':fresh_books,'total_symbols':len(universe),'active_candidates':candidates,
             'entry_passed':approved,'veto_reasons':[{'reason':r,'count':n} for r,n in counts.most_common(8)],
             'notice':'Anlık giriş kontrolü; sebepler aynı adayda birlikte bulunabilir. Üst kademe verisi tüm derinliği veya emir gerçekleşmesini kanıtlamaz.'}

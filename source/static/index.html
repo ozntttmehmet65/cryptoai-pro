@@ -33,7 +33,7 @@
       <p id="professionalCoverage" class="fine">Uzun geçmiş ve dönem testleri hazırlanıyor.</p><p id="ensembleCoverage" class="fine">Coin bazında çoklu model eğitimi bekleniyor.</p>
       <div class="info-grid"><div><label>Güncel alış/satış verisi</label><strong id="bookCoverage">—</strong></div><div><label>Aktif model adayı</label><strong id="entryCandidates">—</strong></div><div><label>Giriş denetimini geçen</label><strong id="entryPassed">—</strong></div><div><label>Emir defteri bağlantısı</label><strong id="bookConnection">—</strong></div></div>
       <div id="executionReasons" class="fine" aria-live="polite">Denetim sebepleri hazırlanıyor…</div>
-      <p class="fine">Makas en çok 8 baz puan ve 0,10 ATR; görünür en iyi alış ve satış tutarı ayrı ayrı en az 1.000 USDT. Toplam stres maliyeti %0,4 ve gözlenen makasla kontrol edilir. Bunlar ihtiyatlı politika eşikleridir; ek getiri kanıtı değildir.</p></div>
+      <p class="fine">Giriş denetimi V7.3.2: Emir defterindeki alış ve satış tutarı, 100 USDT sanal işlem büyüklüğünü karşılamalıdır; bu tutar hesap bakiyeniz değildir. Referans fiyat uzaklığı TP/SL mesafelerinin yarısıyla sınırlı ve en fazla 0,75 ATR olabilir. Makas en çok 8 baz puan ve 0,10 ATR; stres maliyeti %0,4 ve gözlenen makasla kontrol edilir.</p></div>
       <div class="card table-card" id="quickPlanCard" style="margin-bottom:16px">
         <div class="card-title spaced"><div><h2>Birleşik LONG / SHORT Puanlama</h2><p>Her coin için tek yön, 100 üzerinden teyit puanı ve giriş / TP / SL. Geçmiş onayı olmayanlar yalnızca TAKİP ET.</p></div>
         <button class="button ghost" id="quickPlanRefresh">↻ Yenile</button></div>
@@ -78,7 +78,7 @@
         </div>
         <p class="fine" id="paperLegacyNote">Önceki son işlem fiyatı sonuçları V7.2 alış/satış sonuçlarından ayrı tutulur.</p><div class="riskline">Henüz işlem yapılmıyor. Alış/satış örnekleri ve gerçekleşmiş funding kullanılır; ücret ve kayma varsayımdır. Funding kapsamı doğrulanmadan net sonuç gösterilmez. Gerçek emir dolumu, tasfiye ve fiilî kazanç ölçülmez. Kalıcı disk 10 GB; örnekler ara dokunuşları kaçırabilir.</div>
       </div>
-      <p id="paperPolicyNote" class="fine">V7.2 için yeni sanal sonuçlar bekleniyor.</p><div class="card table-card"><div class="card-title"><div><h2>LONG / SHORT kanıt tablosu · V7.2</h2><p>Yalnızca onaylı canlı sanal sinyaller. En az 40 sonuç örnek hacmi için gösterilir; başarı onayı değildir.</p></div></div>
+      <p id="paperPolicyNote" class="fine">Güncel giriş politikasının sanal sonuçları bekleniyor.</p><div class="card table-card"><div class="card-title"><div><h2>LONG / SHORT kanıt tablosu</h2><p>Onaylı canlı sanal sinyallerin tüm giriş politikalarındaki toplamı. En az 40 sonuç örnek hacmi için gösterilir; başarı onayı değildir.</p></div></div>
         <div class="scroll-table"><table><thead><tr><th>Yön</th><th>Sonuç / Gözlem</th><th>TP oranı</th><th>TP %95 alt sınırı</th><th>Kâr faktörü (sanal)</th><th>Ort. net</th><th>Veri eksik</th><th>Kanıt hacmi</th></tr></thead><tbody id="directionalRows"></tbody></table></div>
         <p class="fine">Alt sınır Wilson örnek belirsizliğidir; gözlemler bağımsız olmayabilir ve gelecekteki TP olasılığı değildir. Açık kayıtlar ve eksik veriler oranı etkileyebilir. Kâr faktörü teorik pozitif sonuç toplamının negatif sonuç toplamına oranıdır; gerçek portföy getirisi değildir.</p>
       </div>
@@ -91,6 +91,6 @@
     <footer>© CryptoAI Pro · Gerçek zamanlıya yakın kamuya açık piyasa verileri · Sinyaller garanti değildir · Yazılım MVP</footer>
   </main>
 </div>
-<script src="/static/app.js?v=731quotes" defer></script>
+<script src="/static/app.js?v=732entry" defer></script>
 </body>
 </html>

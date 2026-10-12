@@ -43,7 +43,7 @@ class EntryTests(unittest.TestCase):
                 self.assertTrue(u['reason'])
 
     def test_departure_and_expired_or_unclosed_candle(self):
-        for changes,q in [({},quote(100.4)),({'candle_time':NOW-1_800_001},quote()),({'candle_time':NOW},quote())]:
+        for changes,q in [({},quote(100.8)),({'candle_time':NOW-1_800_001},quote()),({'candle_time':NOW},quote())]:
             p=prediction();p.update(changes)
             self.assertFalse(entry_check(p,q,NOW,book())['approved'])
 
@@ -157,6 +157,16 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(p['signal'],'LONG')
             a.tickers['BTCUSDT']['price']=100
             self.assertEqual(asyncio.run(a.markets(limit=20))['rows'][0]['unified']['status'],'İŞLEM SİNYALİ')
+            # V7.3.2: modest movement and <1,000 USDT liquidity pass every view.
+            a.tickers['BTCUSDT']['price']=100.5
+            a.books['BTCUSDT'].update(bid=100.49,ask=100.51,bid_qty=5.,ask_qty=5.)
+            m=asyncio.run(a.markets(limit=20))
+            detail=asyncio.run(a.symbol_detail('BTCUSDT'))
+            self.assertEqual(m['rows'][0]['unified']['status'],'İŞLEM SİNYALİ')
+            self.assertEqual(detail['unified']['status'],'İŞLEM SİNYALİ')
+            self.assertEqual(asyncio.run(a.opportunities(limit=12))['total'],1)
+            self.assertEqual(a._unified_counts(now)['islem_sinyali'],1)
+            self.assertEqual(a._execution_monitor(int(now*1000))['policy_version'],'V7.3.2')
             with patch.object(a,'_current_drift',return_value=True):
                 self.assertEqual(asyncio.run(a.symbol_detail('BTCUSDT'))['unified']['status'],'BEKLE')
 

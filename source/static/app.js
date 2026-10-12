@@ -282,7 +282,7 @@ function paintPrediction(pred,unified){
   $('barLong').style.width=(u.long_score||0)+'%';$('barShort').style.width=(u.short_score||0)+'%';$('barWait').style.width=u.status==='BEKLE'?'100%':'0%';
   const c=u.components||{},tech=pred?.technical||{}, audit=pred?.execution_quality;
   $('entryChecks').replaceChildren(...(audit?.checks||[]).map(c=>elem('span',{className:'chip '+(c.passed?'green':'amber')},`${({quote:'Fiyat',candle:'Mum',departure:'Giriş mesafesi',reward:'Maliyet',bracket:'TP/SL',book:'Alış/satış',spread:'Makas',liquidity:'Görünür tutar',executable:'Giriş fiyatı',stress:'Stres',model:'Model testi',consensus:'Oy uzlaşması',regime:'Piyasa koşulu',drift:'Sonuç kilidi'})[c.id]||'Veri'} · ${c.passed?'GEÇTİ':'BEKLE'}`)));
-  setText('entryAudit',audit?`Giriş denetimi: ${audit.approved?'GEÇTİ':'BEKLE'} · Makas ${n(audit.spread_bps,2)} bp · Görünür üst kademe ${n(audit.min_top_notional_usdt,0)} USDT · Referanstan uzaklık ${n(audit.reference_departure_atr,2)} ATR · Varsayılan maliyet sonrası ödül / risk ${n(audit.assumed_net_risk_reward,2)} · ${(audit.reasons||[]).join(' · ')}`:'Güncel giriş denetimi bekleniyor.');
+  setText('entryAudit',audit?`Giriş denetimi: ${audit.approved?'GEÇTİ':'BEKLE'} · Makas ${n(audit.spread_bps,2)} bp · Emir defteri üst kademe ${n(audit.min_top_notional_usdt,0)} / gereken ${n(audit.assumptions?.min_top_notional_usdt,0)} USDT · Referans uzaklığı ${n(audit.reference_departure_atr,2)} / sınır ${n(audit.reference_departure_limit_atr,3)} ATR · Varsayılan maliyet sonrası ödül / risk ${n(audit.assumed_net_risk_reward,2)} · ${(audit.reasons||[]).join(' · ')}`:'Güncel giriş denetimi bekleniyor.');
   const votes=pred?.ensemble; const voteText=votes?['LONG','SHORT'].map(side=>{const d=votes[side];return side+': '+(d?d.members.map(m=>`${m.name} ${prob(m.tp_score)} (ağırlık ${prob(m.weight)})`).join(' · ')+` · Uzlaşma ${d.agreement?'VAR':'YOK'}`:'oylama modeli yok')}).join(' | '):'Çoklu model eğitimi bekleniyor';
   setText('modelVotes',voteText);
   setText('regimeDetails',pred?.market_condition?`Piyasa koşulu: ${pred.market_condition.label} · Bu koşulda bağımsız sonuç: ${pred.regime_evidence?.independent_resolved||0} · Koşul izni: ${pred.regime_evidence?.allowed?'VAR':'YOK'}`:'Piyasa koşulu / yeni dönem testi bekleniyor');
@@ -337,8 +337,8 @@ function renderChart(candles){let holder=$('chartContainer');holder.replaceChild
 async function loadPaper(){
   try{const response=await api('/api/paper?limit=200'), summary=response.summary||{},rows=response.rows||[];
     if($('siteError').textContent.startsWith('Sanal gözlemler alınamadı:'))setError('');
-    const v7=response.entry_policy_summary?.['V7.2']||{};
-    setText('paperPolicyNote',`V7.2 giriş politikasıyla ${v7.observed||0} onaylı gözlem, ${v7.closed||0} kapanmış sonuç. Önceki sürümlerin kayıtları tarihsel kanıttır; V7.2 başarısı olarak yorumlanamaz.`);
+    const policy=response.current_entry_policy||'V7.2',v7=response.entry_policy_summary?.[policy]||{};
+    setText('paperPolicyNote',`${policy} giriş politikasıyla ${v7.observed||0} onaylı gözlem, ${v7.closed||0} kapanmış sonuç. Genel toplamlar önceki giriş politikalarını da içerir; yeni politikanın sonuçları burada ayrı sayılır.`);
     setText('paperTotal',n(summary.observed,0));setText('paperClosed',n(summary.settled,0));
     setText('paperWin',summary.win_rate===null?'—':pct(summary.win_rate*100));
     setText('paperAverage',summary.mean_net_return===null?'—':pct(summary.mean_net_return*100));
