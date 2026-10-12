@@ -2,20 +2,20 @@
 from __future__ import annotations
 import math
 from quote_quality import quote_quality, MAX_QUOTE_AGE_SECONDS
+from execution_policy import POLICY_VERSION, PAPER_NOTIONAL_USDT, reference_departure_limit
 
 MAX_ENTRY_DELAY_MS = 900_000
-MAX_REFERENCE_DEPARTURE_ATR = 0.35
 ASSUMED_COST = 0.0016
 STRESS_COST = 0.0040
 MAX_SPREAD_BPS = 8.0
 MAX_SPREAD_ATR_FRACTION = .10
-MIN_TOP_NOTIONAL = 1000.0
-POLICY_VERSION = "V7.2"
+MIN_TOP_NOTIONAL = PAPER_NOTIONAL_USDT
 
 
 def entry_check(pred, quote, now_ms, book=None):
     reasons = []
     departure = net_reward = risk_reward = spread_bps = top_notional = break_even = None
+    departure_limit = None
     checks = []
     def verify(key, label, passed):
         checks.append({"id":key, "label":label, "passed":bool(passed)})
@@ -38,7 +38,9 @@ def entry_check(pred, quote, now_ms, book=None):
             raise ValueError('invalid bracket')
         verify('candle', 'Mum kapanışından sonra giriş penceresi doldu veya mum henüz kapanmadı', 0 <= now_ms - (candle + 900_000) <= MAX_ENTRY_DELAY_MS)
         departure = abs(price/reference - 1)/atr_pct
-        verify('departure', 'Fiyat referans girişten 0,35 ATR uzaklaştı; yeni mum bekleniyor', departure <= MAX_REFERENCE_DEPARTURE_ATR)
+        departure_limit = reference_departure_limit(tp, sl)
+        limit_label = f'{departure_limit:.3f}'.rstrip('0').rstrip('.').replace('.', ',')
+        verify('departure', f'Fiyat referanstan izin verilen {limit_label} ATR sınırını aştı; yeni mum bekleniyor', departure <= departure_limit + 1e-12)
         net_reward = tp*atr_pct - ASSUMED_COST
         risk_reward = net_reward/(sl*atr_pct + ASSUMED_COST)
         verify('reward', 'TP mesafesi varsayılan işlem maliyetini karşılamıyor', net_reward > 0)
@@ -55,9 +57,10 @@ def entry_check(pred, quote, now_ms, book=None):
         top_notional = min(bid*bq, ask*aq)
         verify('spread', 'Alış-satış makası fazla; giriş bekletiliyor',
                spread_bps <= MAX_SPREAD_BPS and spread <= atr_pct*MAX_SPREAD_ATR_FRACTION)
-        verify('liquidity', 'En iyi alış/satış kademesinde görünür tutar 1.000 USDT altında', top_notional >= MIN_TOP_NOTIONAL)
+        verify('liquidity', f'Emir defterinde {MIN_TOP_NOTIONAL:g} USDT sanal işlem için yeterli alış/satış tutarı yok', top_notional >= MIN_TOP_NOTIONAL)
         executable = ask if (pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal'))=='LONG' else bid
-        verify('executable', 'Alış/satış fiyatı referanstan 0,35 ATR uzaklaştı', abs(executable/reference-1)/atr_pct <= MAX_REFERENCE_DEPARTURE_ATR)
+        verify('executable', f'Alış/satış fiyatı izin verilen {limit_label} ATR referans sınırını aştı',
+               departure_limit is not None and abs(executable/reference-1)/atr_pct <= departure_limit + 1e-12)
         side=pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal')
         if side in ('LONG','SHORT'):
             probability=float(pred['p_long' if side=='LONG' else 'p_short'])
@@ -73,8 +76,11 @@ def entry_check(pred, quote, now_ms, book=None):
             'quote_quality':quality,
             'spread_bps':spread_bps, 'min_top_notional_usdt':top_notional,
             'conditional_stress_break_even':break_even,
-            'assumptions':{'max_spread_bps':MAX_SPREAD_BPS,'min_top_notional_usdt':MIN_TOP_NOTIONAL,'stress_total_cost':STRESS_COST},
+            'assumptions':{'max_spread_bps':MAX_SPREAD_BPS,'min_top_notional_usdt':MIN_TOP_NOTIONAL,
+                           'hypothetical_notional_usdt':PAPER_NOTIONAL_USDT,
+                           'max_reference_departure_atr':departure_limit,'stress_total_cost':STRESS_COST},
             'reference_departure_atr': departure,
+            'reference_departure_limit_atr': departure_limit,
             'assumed_net_reward': net_reward, 'assumed_net_risk_reward': risk_reward,
             'notice': 'İhtiyatlı giriş politikasıdır; üst kademe tüm emir defteri değildir. Stres hesabı 24 saatte çözülen TP/SL koşuluna bağlı model puanını kullanır; canlı kâr beklentisi veya doğrulanmış başarı olasılığı değildir'}
 

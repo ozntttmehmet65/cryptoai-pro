@@ -9,11 +9,12 @@ import math
 from datetime import datetime, timezone
 from quality_guard import wilson_lower
 from paper_trade import _bracket
+from execution_policy import POLICY_VERSION, PAPER_NOTIONAL_USDT
 
 METHOD='bid_ask_funding_v72'
 FEE_PER_LEG=.0006
 SLIPPAGE_PER_LEG=.0002
-NOTIONAL=100.
+NOTIONAL=PAPER_NOTIONAL_USDT
 MAX_GAP_MS=180000
 
 
@@ -152,7 +153,7 @@ def report(db,limit=100,historical=None):
         r=dict(zip(keys,values));r['settlement_method']=METHOD;r['legacy']=False
         for k in ('observed_at','result_at'):r[k]=datetime.fromtimestamp(r[k]/1000,timezone.utc).isoformat() if r[k] else None
         r['last_quote_at']=datetime.fromtimestamp(r.pop('last_quote_ms')/1000,timezone.utc).isoformat();rows.append(r)
-    all_rows=db.execute('SELECT signal,state,exit_reason,net_return,shadow FROM executable_paper').fetchall()
+    all_rows=db.execute('SELECT signal,state,exit_reason,net_return,shadow,entry_audit FROM executable_paper').fetchall()
     approved=[r for r in all_rows if not r[4]];shadow=[r for r in all_rows if r[4]]
     closed=[r for r in approved if r[1]=='CLOSED'];tp=sum(r[2]=='TP' for r in closed);sl=sum(r[2]=='SL' for r in closed)
     states={}
@@ -175,8 +176,20 @@ def report(db,limit=100,historical=None):
         'shadow_observations':len(shadow),'shadow_settled':len(shadow_closed),
         'shadow_tp_count':sum(r[2]=='TP' for r in shadow_closed),'shadow_sl_count':sum(r[2]=='SL' for r in shadow_closed),
         'shadow_unverified':sum(r[1]=='VERI_EKSIK' for r in shadow)}
+    policies={}
+    for row in approved:
+        try:
+            audit=json.loads(row[5] or '{}')
+            policy=audit.get('policy_version','V7.2') if isinstance(audit,dict) else 'V7.2'
+            if not isinstance(policy,str) or not policy:policy='V7.2'
+        except (ValueError,TypeError):policy='V7.2'
+        group=policies.setdefault(policy,{'observed':0,'closed':0,'tp':0,'unverified':0})
+        group['observed']+=1
+        group['closed']+=int(row[1]=='CLOSED')
+        group['tp']+=int(row[1]=='CLOSED' and row[2]=='TP')
+        group['unverified']+=int(row[1]=='VERI_EKSIK')
     return {'method':METHOD,'summary':summary,'directional':directional,'rows':rows,
-        'entry_policy_summary':{'V7.2':{'observed':len(approved),'closed':len(closed),'tp':tp,'unverified':states.get('VERI_EKSIK',0)}},
+        'current_entry_policy':POLICY_VERSION,'entry_policy_summary':policies,
         'historical_last_trade_summary':old,'historical_directional':h.get('directional',{}),
         'cost_assumptions':{'fee_per_leg':FEE_PER_LEG,'adverse_slippage_per_leg':SLIPPAGE_PER_LEG,'hypothetical_notional':NOTIONAL,
             'funding':'Settled historical rates and their mark prices; entry < funding event <= exit'},
