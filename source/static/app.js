@@ -251,7 +251,7 @@ async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
     setText('homeVersion',`${trained}/${total} profesyonel model`);
     setChip('modelTag',trained>0,`${trained}/${total} PROFESYONEL`);
     setText('modelAlgo','Logistic + Gradient Boosting + Extra Trees · ağırlıklı oy');
-    const migration=`V7.3 geçişi: ${x.pipeline_trained||0}/${total} · Bekleyen: ${x.pipeline_pending??total}`;
+    const migration=`${x.training_pipeline_version||'Güncel'} geçişi: ${x.pipeline_trained||0}/${total} · Bekleyen: ${x.pipeline_pending??total}`;
     setText('modelVersion',migration);
     setText('modelDate','Her coin için ayrı tarih');
     setText('modelDates','Hedef 18.000 gerçek 15dk mum (yaklaşık 187 gün); yeni coinler daha kısa olabilir');
