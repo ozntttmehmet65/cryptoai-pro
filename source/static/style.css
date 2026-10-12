@@ -16,3 +16,5 @@
 .v60-item .v60-note{font-size:12px;line-height:1.6;opacity:.85;margin-top:9px}
 .v60-item .details-button{margin-top:10px}
 @media(max-width:600px){.v60-opportunities{grid-template-columns:1fr}.v60-item{padding:12px}}
+
+.score-explanation{white-space:normal;min-width:200px;max-width:250px;overflow-wrap:anywhere}.decision-reason{white-space:pre-line;min-width:240px;max-width:320px;overflow-wrap:anywhere}
