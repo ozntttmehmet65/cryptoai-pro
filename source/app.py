@@ -28,6 +28,7 @@ from professional import POLICY as PROFESSIONAL_POLICY, HISTORY_TARGET, correlat
 from quality_guard import live_drift_block
 from execution_guard import guarded_prediction
 from execution_policy import POLICY_VERSION as ENTRY_POLICY_VERSION
+from order_depth import depth_worker, selected_symbols as depth_symbols, MAX_AGE_SECONDS as DEPTH_MAX_AGE
 from ml_engine import ModelEngine
 from unified_scoring import combined_assessment
 from coin_models import CoinModelRegistry, INFERENCE_HISTORY_BARS
@@ -140,6 +141,8 @@ async def _training_bars(symbol: str):
     saved_at = 0
     previous_attempt = 0
     previous_target = 0
+    backfill_exhausted = False
+    backfill_retry_at = 0
     try:
         obj = json.loads(f.read_text(encoding="utf-8"))
         if obj.get("symbol") == symbol:
@@ -147,6 +150,8 @@ async def _training_bars(symbol: str):
             saved_at = int(obj.get("fetched_at", 0))
             previous_attempt = int(obj.get("older_backfill_attempted_at",0))
             previous_target = int(obj.get("older_backfill_target_count", 3000 if previous_attempt else 0))
+            backfill_exhausted = obj.get('older_backfill_exhausted') is True
+            backfill_retry_at = float(obj.get('older_backfill_retry_at',0))
     except (OSError, ValueError, TypeError, KeyError):
         pass
     now=time.time()
@@ -169,31 +174,45 @@ async def _training_bars(symbol: str):
     merged=[clean[k] for k in sorted(clean)][-TRAIN_CANDLES:]
     # Page backwards only once per day for immature listings or unavailable
     # history; never invent missing bars and never fetch already-seen timestamps.
-    if (merged and TRAIN_CANDLES>1500 and len(merged)<TRAIN_CANDLES
-            and (not previous_attempt or now-previous_attempt>=24*3600
+    if (merged and TRAIN_CANDLES>1500 and len(merged)<TRAIN_CANDLES and now>=backfill_retry_at
+            and (not backfill_exhausted or not previous_attempt or now-previous_attempt>=24*3600
                  or previous_target < TRAIN_CANDLES)):
         previous_attempt=int(now)
         previous_target=TRAIN_CANDLES
+        backfill_exhausted=False
         for _ in range(4):  # Bounded backfill; continue on a later daily attempt.
             if len(merged)>=TRAIN_CANDLES:
                 break
             oldest=int(merged[0]["time"])
-            earlier=await client.klines(symbol, limit=min(1500,TRAIN_CANDLES-len(merged)),
-                                        end_time=oldest-1)
+            try:
+                earlier=await client.klines(symbol, limit=min(1500,TRAIN_CANDLES-len(merged)),
+                                            end_time=oldest-1)
+            except Exception:
+                # Retain successful pages, but don't retry a failed endpoint immediately.
+                _atomic_json(f,{'symbol':symbol,'fetched_at':int(now),'candles':merged,
+                    'older_backfill_attempted_at':previous_attempt,'older_backfill_target_count':previous_target,
+                    'older_backfill_exhausted':False,'older_backfill_retry_at':now+3600})
+                raise
             extra={int(b["time"]):b for b in earlier
                    if int(b["close_time"]) < oldest and int(b["time"]) not in clean}
             if not extra:
+                backfill_exhausted=True
                 break
             clean.update(extra)
             merged=[clean[k] for k in sorted(clean)][-TRAIN_CANDLES:]
             # Preserve each successful page if a later request is interrupted.
             _atomic_json(f,{"symbol":symbol,"fetched_at":int(now),
                             "older_backfill_attempted_at":previous_attempt,
+                            "older_backfill_exhausted":False,
+                            "older_backfill_retry_at":0,
                             "older_backfill_target_count":previous_target,"candles":merged})
             if len(earlier)<min(1500,TRAIN_CANDLES-len(merged)) and len(extra)<100:
+                backfill_exhausted=True
                 break
     _atomic_json(f,{"symbol":symbol,"fetched_at":int(now),
                     "older_backfill_attempted_at":previous_attempt,
+                    "older_backfill_exhausted":backfill_exhausted,
+                    "older_backfill_retry_at":backfill_retry_at,
                     "older_backfill_target_count":previous_target,"candles":merged})
     # Keep only the latest consecutive real segment, never fill a history gap.
     cut=len(merged)-1
@@ -246,9 +265,35 @@ def _stream_prices(updates):
 def _stream_books(updates):
     updates=merge_ordered(books, updates)
     if not updates:return
+    _process_books(updates)
+
+
+depth_books={}
+
+
+def _market_book(symbol,now_ms):
+    top=books.get(symbol)
+    depth=depth_books.get(symbol)
+    if depth and 0<=now_ms/1000-depth.get('updated_at',0)<DEPTH_MAX_AGE and (not top or depth['updated_at']>=top.get('updated_at',0)):
+        return depth
+    return top
+
+
+def _depth_symbols():
+    opened=[r[0] for r in db.execute("SELECT DISTINCT symbol FROM executable_paper WHERE state='OPEN' AND shadow=0 ORDER BY symbol").fetchall()]
+    return depth_symbols(universe,tickers,signals,opened)
+
+
+def _stream_depth(updates):
+    updates=merge_ordered(depth_books,updates)
+    if updates:_process_books(updates)
+
+
+def _process_books(updates):
     try:
         now_ms=int(time.time()*1000)
-        changed=execution_paper.reconcile_books(db,updates,now_ms)
+        selected={symbol:_market_book(symbol,now_ms) for symbol in updates}
+        changed=execution_paper.reconcile_books(db,selected,now_ms)
         if changed:_drift_cache.clear();_quality_cache.clear()
         for symbol in updates:
             pred=_active_prediction(symbol,now_ms)
@@ -379,7 +424,7 @@ _quality_cache = {}
 
 
 def observe_paper(db,symbol,pred,observed_price,now_ms,*,shadow=False):
-    created=execution_paper.observe(db,symbol,pred,books.get(symbol),now_ms,shadow=shadow)
+    created=execution_paper.observe(db,symbol,pred,_market_book(symbol,now_ms),now_ms,shadow=shadow)
     if created:
         quality_report.record(db,symbol,pred,now_ms)
         _quality_cache.clear()
@@ -403,7 +448,7 @@ def _guard(symbol, pred, now_ms):
     side = pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal')
     permission = coin_engine.permissions(symbol).get(side, {}).get('approved', False)
     return guarded_prediction(pred, tickers.get(symbol), now_ms, permission,
-                              (_current_drift(side, now_ms) or _current_drift(side, now_ms, symbol, pred.get('model_version'))) if side in ('LONG', 'SHORT') else False, book=books.get(symbol))
+                              (_current_drift(side, now_ms) or _current_drift(side, now_ms, symbol, pred.get('model_version'))) if side in ('LONG', 'SHORT') else False, book=_market_book(symbol,now_ms))
 
 
 def _active_prediction(symbol, now_ms):
@@ -745,6 +790,7 @@ def _professional_report(now_ms):
         'pending_results':db.execute("SELECT COUNT(*) FROM executable_paper WHERE shadow=0 AND state='AWAITING_FUNDING'").fetchone()[0]}
     value['policy']=PROFESSIONAL_POLICY
     value['release']='V7.2'
+    value['entry_policy']=ENTRY_POLICY_VERSION
     _quality_cache['report']=(now_ms,value);return value
 
 
@@ -757,6 +803,7 @@ async def lifespan(app: FastAPI):
              asyncio.create_task(coin_training_worker()),
              asyncio.create_task(ticker_worker(lambda: set(universe), _stream_prices, _stream_status)),
              asyncio.create_task(ticker_worker(lambda: set(universe), _stream_books, _book_status, url=BOOK_URL, parser=parse_books)),
+             asyncio.create_task(depth_worker(_depth_symbols,_stream_depth,lambda value:status.update(depth_source='WebSocket: '+value))),
              asyncio.create_task(kline_worker(_live_symbols, _on_kline_close, _kline_state)),
              asyncio.create_task(history_warm_worker()),
              asyncio.create_task(stream_signal_worker()),
@@ -814,6 +861,9 @@ def _execution_monitor(now_ms):
         if pred.get('signal') in ('LONG','SHORT') and audit.get('approved'):approved+=1
         counts.update(set(audit.get('reasons') or []))
     return {'policy_version':ENTRY_POLICY_VERSION,'book_stream':status.get('book_source','Bekleniyor'),
+            'depth_stream':status.get('depth_source','Bekleniyor'),
+            'depth_watched':len(_depth_symbols()),
+            'fresh_depth_books':sum(1 for s,d in depth_books.items() if s in universe and 0<=now_ms/1000-d.get('updated_at',0)<DEPTH_MAX_AGE),
             'fresh_books':fresh_books,'total_symbols':len(universe),'active_candidates':candidates,
             'entry_passed':approved,'veto_reasons':[{'reason':r,'count':n} for r,n in counts.most_common(8)],
             'notice':'Anlık giriş kontrolü; sebepler aynı adayda birlikte bulunabilir. Üst kademe verisi tüm derinliği veya emir gerçekleşmesini kanıtlamaz.'}
@@ -834,11 +884,25 @@ def _signal_diagnostics(now_ms):
     failures = {side: Counter() for side in ('LONG', 'SHORT')}
     labels = {}
     stages = Counter()
+    model_causes=Counter()
     for symbol in universe:
         if not coin_engine.ready(symbol):
             stages['model_pending'] += 1
             continue
         for side, permission in coin_engine.permissions(symbol).items():
+            info=coin_engine.info(symbol) or {}
+            direction=(info.get('directional_validation') or {}).get(side) or {}
+            policy=info.get('decision_policy')
+            choices=policy.get('candidates',[]) if isinstance(policy,dict) else []
+            validation_rows=[r['directions'].get(side,{}) for r in choices
+                             if isinstance(r,dict) and isinstance(r.get('directions'),dict)]
+            model_causes['directions_checked']+=1
+            if permission['approved']:model_causes['directions_approved']+=1
+            if direction.get('calibration_alpha')==0:model_causes['baseline_only']+=1
+            if validation_rows and all(r.get('signals',0)==0 for r in validation_rows):model_causes['validation_no_candidates']+=1
+            elif validation_rows and all(r.get('mean_stressed_net_return') is None or r['mean_stressed_net_return']<=0 for r in validation_rows):model_causes['validation_no_positive_net']+=1
+            if direction.get('signals',0)==0:model_causes['holdout_no_candidates']+=1
+            if info.get('historical_candles_used',0)<TRAIN_CANDLES:model_causes['history_below_target']+=1
             for row in permission.get('checks', []):
                 if not row['passed']:
                     failures[side][row['id']] += 1
@@ -856,6 +920,7 @@ def _signal_diagnostics(now_ms):
             if active and active.get('signal') in ('LONG', 'SHORT'):
                 stages['entry_approved'] += 1
     return {'as_of': now_ms, 'stages': dict(stages),
+            'model_causes':dict(model_causes),
             'required_inference_bars': INFERENCE_HISTORY_BARS,
             'model_rejections': {side: [{'id': key, 'reason': labels[key], 'count': count}
                                       for key, count in counter.most_common()]
@@ -873,7 +938,7 @@ async def signal_diagnostics():
 async def health():
     now = time.time()
     fresh = status["tickers_updated"] is not None and now - status["tickers_updated"] < 120
-    return {"server_time":int(now*1000), "quote_freshness_version":"V7.3.1",
+    return {"server_time":int(now*1000), "quote_freshness_version":"V7.3.1", "release":ENTRY_POLICY_VERSION,
             "provider": "Binance USDⓈ-M Futures (WebSocket tickers + REST candles + official archive)", "provider_ok": fresh,
             "model_ready": coin_engine.stats(universe)["professional_trained"] > 0,
             "model_training": status["model_training"],
@@ -1138,7 +1203,9 @@ async def coin_model_list(limit: int = Query(100, ge=1, le=1000)):
                           "test_samples":info.get("test_samples"),
                           "long_failed_checks":p["LONG"].get("failed_checks", []),
                           "short_failed_checks":p["SHORT"].get("failed_checks", []),
-                          "decision_threshold":(info.get("decision_policy") or {}).get("threshold", .65)})
+                          "decision_threshold":(info.get("decision_policy") or {}).get("threshold", .65),
+                          "direction_thresholds":(info.get('decision_policy') or {}).get('thresholds'),
+                          "training_pipeline_version":info.get('training_pipeline_version')})
     return {"stats":coin_engine.stats(universe),"models":models[:limit],"total_models":len(models)}
 
 

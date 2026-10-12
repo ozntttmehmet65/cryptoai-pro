@@ -8,7 +8,7 @@ import math
 import numpy as np
 from quality_guard import approved, tp_sl_direction_metrics
 
-POLICY_VERSION = 'validation_threshold_v1'
+POLICY_VERSION = 'validation_direction_threshold_v2'
 THRESHOLDS = (.55, .60, .65, .70, .75)
 DEFAULT_THRESHOLD = .65
 DIRECTION_MARGIN = .10
@@ -17,11 +17,15 @@ DIRECTION_MARGIN = .10
 def valid_policy(policy):
     if not isinstance(policy, dict):
         return False
-    return (policy.get('version') == POLICY_VERSION
+    return (policy.get('version') in (POLICY_VERSION, 'validation_threshold_v1')
             and policy.get('chosen_on') == 'chronological_validation_only'
             and policy.get('threshold') in THRESHOLDS
             and policy.get('direction_margin') == DIRECTION_MARGIN
-            and policy.get('frozen_before_holdout') is True)
+            and policy.get('frozen_before_holdout') is True
+            and (policy.get('version') != POLICY_VERSION or
+                 isinstance(policy.get('thresholds'), dict) and
+                 all(policy['thresholds'].get(s) in THRESHOLDS for s in ('LONG','SHORT')) and
+                 policy['threshold']==min(policy['thresholds'][s] for s in ('LONG','SHORT'))))
 
 
 def decide(p_long, p_short, policy=None):
@@ -34,10 +38,11 @@ def decide(p_long, p_short, policy=None):
     # Malformed new policy is not silently interpreted as legacy approval.
     if policy is not None and not valid_policy(policy):
         return 'BEKLE', 0.
+    thresholds = policy['thresholds'] if policy and policy['version']==POLICY_VERSION else {}
     threshold = policy['threshold'] if policy else DEFAULT_THRESHOLD
-    if long >= threshold and long >= short + DIRECTION_MARGIN:
+    if long >= thresholds.get('LONG', threshold) and long >= short + DIRECTION_MARGIN:
         return 'LONG', long
-    if short >= threshold and short >= long + DIRECTION_MARGIN:
+    if short >= thresholds.get('SHORT', threshold) and short >= long + DIRECTION_MARGIN:
         return 'SHORT', short
     return 'BEKLE', 0.
 
@@ -52,6 +57,7 @@ def select_policy(p_long, p_short, outcomes, atrs, times, risk_plan, agreements=
     summaries = []
     for threshold in THRESHOLDS:
         policy = dict(version=POLICY_VERSION, threshold=threshold,
+                      thresholds={s:threshold for s in ('LONG','SHORT')},
                       direction_margin=DIRECTION_MARGIN,
                       chosen_on='chronological_validation_only',
                       frozen_before_holdout=True)
@@ -83,10 +89,17 @@ def select_policy(p_long, p_short, outcomes, atrs, times, risk_plan, agreements=
         summaries.append(dict(threshold=threshold, directions=directions,
                               passed_directions=len(passed),
                               objective=min(m['mean_stressed_net_return'] for m in passed) if passed else None))
-    eligible = [row for row in summaries if row['passed_directions']]
-    best = max(eligible, key=lambda row: (row['passed_directions'], row['objective'], row['threshold'])) if eligible else next(row for row in summaries if row['threshold'] == DEFAULT_THRESHOLD)
-    return dict(version=POLICY_VERSION, threshold=best['threshold'], direction_margin=DIRECTION_MARGIN,
+    selected = {}
+    for side in ('LONG','SHORT'):
+        eligible = [row for row in summaries if row['directions'][side]['passed']]
+        selected[side] = (max(eligible, key=lambda row:
+                         (row['directions'][side]['mean_stressed_net_return'], row['threshold']))
+                         if eligible else next(row for row in summaries if row['threshold']==DEFAULT_THRESHOLD))
+    thresholds = {s:row['threshold'] for s,row in selected.items()}
+    return dict(version=POLICY_VERSION, threshold=min(thresholds.values()), thresholds=thresholds,
+                direction_margin=DIRECTION_MARGIN,
                 chosen_on='chronological_validation_only', frozen_before_holdout=True,
-                validation_passed={side: row['passed'] for side, row in best['directions'].items()},
-                validation_summary=best['directions'], candidates=summaries,
-                search_succeeded=bool(eligible), holdout_used_for_selection=False)
+                validation_passed={side:row['directions'][side]['passed'] for side,row in selected.items()},
+                validation_summary={side:row['directions'][side] for side,row in selected.items()}, candidates=summaries,
+                search_succeeded=any(row['directions'][side]['passed'] for side,row in selected.items()),
+                holdout_used_for_selection=False)
