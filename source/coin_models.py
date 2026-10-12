@@ -35,7 +35,7 @@ from symbol_utils import symbol_valid, symbol_file_key
 from decision_policy import decide, select_policy, valid_policy
 
 INFERENCE_HISTORY_BARS = 1200
-TRAINING_PIPELINE_VERSION = "v73"
+TRAINING_PIPELINE_VERSION = "v74"
 from professional import POLICY as PROFESSIONAL_POLICY, HISTORY_TARGET, professional_audit, market_condition, market_regimes
 
 LOG = logging.getLogger(__name__)
@@ -162,7 +162,7 @@ class CoinModelRegistry:
         return bool(self.professional_ready(symbol)
                     and info.get('training_pipeline_version') == TRAINING_PIPELINE_VERSION
                     and isinstance(info.get('artifact_schema'), int)
-                    and info.get('artifact_schema', 0) >= 3
+                    and info.get('artifact_schema', 0) >= 4
                     and valid_policy(info.get('decision_policy')))
 
     def training_due(self, symbol, now=None, interval_hours=6, retry_seconds=3600):
@@ -238,7 +238,9 @@ class CoinModelRegistry:
         if not isinstance(model, dict) or model.get("kind") != ENSEMBLE_POLICY:
             return np.zeros(len(data)), np.zeros(len(data), dtype=bool), []
         raw = cls._predict_tp(model, data)  # Validate the whole payload first.
-        votes = np.stack([cls.calibrated(cls._predict_tp(m["model"], data), calibration)
+        member_calibrations = (calibration or {}).get('members')
+        votes = np.stack([cls.calibrated(cls._predict_tp(m["model"], data),
+                          member_calibrations.get(m['name']) if isinstance(member_calibrations,dict) else calibration)
                           for m in model["members"]])
         weights = np.asarray(model["weights"], dtype=float)
         spread = votes.max(axis=0) - votes.min(axis=0)
@@ -411,6 +413,10 @@ class CoinModelRegistry:
             models[direction] = winner
             calibration = self.fit_calibration(
                 raw_validation, va_y, baseline_rate)
+            if calibration is not None:
+                calibration['members'] = {member['name']:self.fit_calibration(
+                    self._predict_tp(member['model'],x_va),va_y,baseline_rate) for member in members}
+                calibration['member_fit_source'] = 'chronological_validation_only'
             calibrations[direction] = calibration
             comparison["calibration"] = calibration
             validation_probs[direction], validation_agreement[direction], _ = self.vote_details(
@@ -529,9 +535,9 @@ class CoinModelRegistry:
                 "test_method":"fixed_score>=6.5; purged chronological unseen TP/SL first touch (24h censored)",
                 "notice":"Exploratory technical confirmation; historical correlation and multiple-comparison risk. Not guaranteed live P(TP)."}
         date = datetime.now(timezone.utc)
-        version = date.strftime("coin-%Y%m%dT%H%M%S%fZ") + "-" + symbol + "-v73"
+        version = date.strftime("coin-%Y%m%dT%H%M%S%fZ") + "-" + symbol + "-v74"
         info = {
-            "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":3,
+            "symbol": symbol, "version":version, "model_family":MODEL_FAMILY, "artifact_schema":4,
             "training_pipeline_version":TRAINING_PIPELINE_VERSION,"decision_policy":policy,
             "inference_history_bars":INFERENCE_HISTORY_BARS,
             "algorithm":"Per-direction LogisticRegression + HistGradientBoosting + ExtraTrees weighted soft voting, validation-only calibration and fixed consensus veto",
@@ -565,7 +571,8 @@ class CoinModelRegistry:
         tmp_model = self.directory / f".{file_key}.tmp.joblib"
         tmp_info = self.directory / f".{file_key}.tmp.json"
         payload={"models":models,"calibration":calibrations,"version":version,"model_family":MODEL_FAMILY,
-                 "ensemble_policy":ENSEMBLE_POLICY,"professional_policy":PROFESSIONAL_POLICY,"decision_policy":policy}
+                 "ensemble_policy":ENSEMBLE_POLICY,"professional_policy":PROFESSIONAL_POLICY,"decision_policy":policy,
+                 "training_pipeline_version":TRAINING_PIPELINE_VERSION}
         # Keep the candidate and previous champion as independent version files.
         # Promotion preserves every currently approved incumbent direction unless
         # the candidate also passes that direction. Comparing scores from different
@@ -623,6 +630,9 @@ class CoinModelRegistry:
                 return None
             if info.get("artifact_schema",0)>=3 and (not valid_policy(info.get("decision_policy")) or model.get("decision_policy")!=info.get("decision_policy")):
                 LOG.warning("Decision policy and artifact mismatch: %s",symbol)
+                return None
+            if info.get('artifact_schema',0)>=4 and model.get('training_pipeline_version')!=info.get('training_pipeline_version'):
+                LOG.warning('Training pipeline and artifact mismatch: %s',symbol)
                 return None
             self.cache[symbol] = model
             while len(self.cache) > self.max_in_memory:

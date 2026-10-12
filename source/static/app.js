@@ -45,7 +45,7 @@ function paintHealth(h){state.health=h;let ready=h.provider_ok&&h.model_ready;
   const monitor=h.execution_monitor||{};
   setText('bookCoverage',`${monitor.fresh_books||0} / ${monitor.total_symbols||0}`);
   setText('entryCandidates',String(monitor.active_candidates||0));setText('entryPassed',String(monitor.entry_passed||0));
-  setText('bookConnection',monitor.book_stream||'Bekleniyor');
+  setText('bookConnection',`${monitor.book_stream||'Bekleniyor'} · 20 kademe: ${monitor.depth_stream||'Bekleniyor'} (${monitor.fresh_depth_books||0}/${monitor.depth_watched||0})`);
   setChip('executionChip',monitor.fresh_books>0,monitor.fresh_books>0?'GİRİŞ POLİTİKASI AKTİF':'VERİ BEKLENİYOR');
   $('executionReasons').replaceChildren(...(monitor.veto_reasons||[]).map(x=>elem('p',{},`${x.count} aday · ${x.reason}`)));
   if(!(monitor.veto_reasons||[]).length)setText('executionReasons','Engellenen güncel model adayı yok. Sinyal üretmek için doğrulanmış model ve yeni kapanmış mum gerekir.');
@@ -58,6 +58,8 @@ function paintHealth(h){state.health=h;let ready=h.provider_ok&&h.model_ready;
   setChip('modelChip',h.model_ready,'OY MODELİ: '+(coins.ensemble_trained||0)+'/'+(coins.eligible||h.symbol_count||0));
   setText('professionalCoverage',`Profesyonel dönem denetimi tamamlanan: ${coins.professional_trained||0}/${coins.eligible||h.symbol_count||0} · Geçiş bekleyen: ${coins.professional_pending||0} · Geçmiş hedefi ${n(coins.history_target||18000,0)} gerçek 15dk mum. Eğitim sırayla sürer; dönem testi geçmeden yön onaylanmaz.`);
   setText('ensembleCoverage',`Oylama eğitimi tamamlanan: ${coins.ensemble_trained||0}/${coins.eligible||h.symbol_count||0} coin · Geçiş bekleyen: ${coins.ensemble_pending||0} · Her yönde 3 algoritma hedefi, en az 2 oy modeli. Uzlaşma ve bağımsız yön testi olmadan işlem sinyali verilmez.`);
+  const cause=h.signal_diagnostics?.model_causes||{};
+  if(cause.directions_checked)$('ensembleCoverage').append(document.createTextNode(` ${coins.training_pipeline_version||'Güncel'} hesaplama geçişi: ${coins.pipeline_trained||0}/${coins.eligible||h.symbol_count||0}. Yön bazında: yalnız baz oranına düşen ${cause.baseline_only||0}, doğrulamada hiç aday üretmeyen ${cause.validation_no_candidates||0}, aday üretip pozitif stres sonucu bulunmayan ${cause.validation_no_positive_net||0}. Bunlar birbirleriyle örtüşebilir; canlı giriş vetolarından ayrı model sorunlarıdır.`));
   setText('statLong',String(h.unified_counts?.islem_sinyali??'—'));
   setText('statShort',String(h.unified_counts?.takip_et??'—'));
   setText('statTechLong',String(h.unified_counts?.long??'—'));
@@ -81,6 +83,17 @@ function decisionBadge(u){
   return elem('span',{className:'tag '+(approved?signalClass(u.direction):'wait')},
               u.direction+(approved?' · ONAYLI':' · TAKİP'));
 }
+function decisionExplanation(row){
+  const u=row.unified||{},a=u.execution_quality||{},failed=new Set((a.checks||[]).filter(c=>!c.passed).map(c=>c.id));
+  const lines=[u.reason||'Karar bekleniyor'];
+  if(failed.has('liquidity'))lines.push(`${a.liquidity_method==='depth20_vwap'?'20 kademe':'Üst kademe'} görünür tutar: ${n(a.min_top_notional_usdt,2)} / gereken ${n(a.assumptions?.hypothetical_notional_usdt,0)} USDT`);
+  if(failed.has('departure'))lines.push(`Son fiyat uzaklığı: ${n(a.reference_departure_atr,3)} / sınır ${n(a.reference_departure_limit_atr,3)} ATR`);
+  if(failed.has('executable'))lines.push(`Giriş fiyatı uzaklığı: ${n(a.executable_departure_atr,3)} / sınır ${n(a.reference_departure_limit_atr,3)} ATR`);
+  if(failed.has('depth_impact'))lines.push(`Kademe kayması: ${n(a.depth_impact_bps,2)} / sınır ${n(a.assumptions?.max_depth_impact_bps,2)} baz puan`);
+  if(failed.has('quote'))lines.push(`Fiyat yaşı: ${n(a.quote_quality?.age_seconds,1)} saniye`);
+  if(u.status==='TAKİP ET'&&failed.size)lines.push('Giriş kontrolleri henüz geçilmedi; takip kararı işlem onayı değildir.');
+  return lines.join('\n');
+}
 function rowCells(row,details=false){
   let t=elem('tr');let sym=elem('td');sym.append(elem('span',{},row.symbol));t.append(sym);
   const priceCell=elem('td');paintQuoteCell(priceCell,row);t.append(priceCell);
@@ -89,11 +102,12 @@ function rowCells(row,details=false){
   const u=row.unified||{};let c=elem('td');c.append(decisionBadge(u));t.append(c);
   t.append(elem('td',{},u.score==null?'—':n(u.score,0)+'/100'));
   if(details){
-    const reasons=elem('td',{className:'small'});
+    const reasons=elem('td',{className:'small score-explanation'});
     const parts=u.components||{};
-    const text=(u.direction?'AI '+n(parts.ai,1)+' · Gösterge '+n(parts.indicators,1)+' · Trend '+n(parts.higher_timeframe,1)+' · Formasyon '+n(parts.patterns,1):u.reason||'—');
+    const text=(u.score==null?'Puan hesaplanmadı':'AI '+n(parts.ai,1)+' · Gösterge '+n(parts.indicators,1)+' · Trend '+n(parts.higher_timeframe,1)+' · Formasyon '+n(parts.patterns,1)+' · Geçmiş teyit '+n(parts.tested_setup,1)+' · Risk kesintisi −'+n(parts.risk_penalty,1));
     reasons.textContent=text;
     t.append(reasons);
+    t.append(elem('td',{className:'small decision-reason'},decisionExplanation(row)));
     t.append(elem('td',{className:'muted'},dt(row.candle_closed_at)));
     t.append(elem('td',{className:'muted'},row.coverage));
     const act=elem('td'),btn=elem('button',{className:'details-button','aria-label':row.symbol+' grafiğini aç'},'İncele →');
@@ -117,7 +131,7 @@ function fillSymbolPicker(){const picker=$('symbolSelect');let old=state.selecte
 }
 function paintSignals(){let tbody=$('signalsRows');tbody.replaceChildren();let slice=state.rows.slice(0,state.visible);
   slice.forEach(row=>tbody.append(rowCells(row,true)));
-  if(!slice.length){let tr=elem('tr');tr.append(elem('td',{colspan:'9',className:'placeholder'},'Eşleşen sözleşme yok veya veri bekleniyor.'));tbody.append(tr)}
+  if(!slice.length){let tr=elem('tr');tr.append(elem('td',{colspan:'11',className:'placeholder'},'Eşleşen sözleşme yok veya veri bekleniyor.'));tbody.append(tr)}
   setText('resultCount',`${state.total} sonuç`);setText('paginationText',`${slice.length} / ${state.total} gösteriliyor`);$('loadMore').classList.toggle('hidden',state.visible>=state.rows.length);
 }
 // UI price transport: same-origin WebSocket, fed only by authenticated Binance
@@ -237,7 +251,7 @@ async function loadModel(){try{let obj=await api('/api/model');state.model=obj;
     setText('homeVersion',`${trained}/${total} profesyonel model`);
     setChip('modelTag',trained>0,`${trained}/${total} PROFESYONEL`);
     setText('modelAlgo','Logistic + Gradient Boosting + Extra Trees · ağırlıklı oy');
-    const migration=`V7.3 geçişi: ${x.pipeline_trained||0}/${total} · Bekleyen: ${x.pipeline_pending??total}`;
+    const migration=`${x.training_pipeline_version||'Güncel'} geçişi: ${x.pipeline_trained||0}/${total} · Bekleyen: ${x.pipeline_pending??total}`;
     setText('modelVersion',migration);
     setText('modelDate','Her coin için ayrı tarih');
     setText('modelDates','Hedef 18.000 gerçek 15dk mum (yaklaşık 187 gün); yeni coinler daha kısa olabilir');
@@ -281,7 +295,7 @@ function paintPrediction(pred,unified){
   setText('pLong',u.long_score==null?'—':n(u.long_score,0)+'/100');setText('pShort',u.short_score==null?'—':n(u.short_score,0)+'/100');setText('pWait',u.status||'BEKLE');
   $('barLong').style.width=(u.long_score||0)+'%';$('barShort').style.width=(u.short_score||0)+'%';$('barWait').style.width=u.status==='BEKLE'?'100%':'0%';
   const c=u.components||{},tech=pred?.technical||{}, audit=pred?.execution_quality;
-  $('entryChecks').replaceChildren(...(audit?.checks||[]).map(c=>elem('span',{className:'chip '+(c.passed?'green':'amber')},`${({quote:'Fiyat',candle:'Mum',departure:'Giriş mesafesi',reward:'Maliyet',bracket:'TP/SL',book:'Alış/satış',spread:'Makas',liquidity:'Görünür tutar',executable:'Giriş fiyatı',stress:'Stres',model:'Model testi',consensus:'Oy uzlaşması',regime:'Piyasa koşulu',drift:'Sonuç kilidi'})[c.id]||'Veri'} · ${c.passed?'GEÇTİ':'BEKLE'}`)));
+  $('entryChecks').replaceChildren(...(audit?.checks||[]).map(c=>elem('span',{className:'chip '+(c.passed?'green':'amber')},`${({quote:'Fiyat',candle:'Mum',departure:'Giriş mesafesi',reward:'Maliyet',bracket:'TP/SL',book:'Alış/satış',spread:'Makas',liquidity:'Görünür tutar',depth_impact:'Kademe kayması',executable:'Giriş fiyatı',stress:'Stres',model:'Model testi',consensus:'Oy uzlaşması',regime:'Piyasa koşulu',drift:'Sonuç kilidi'})[c.id]||'Veri'} · ${c.passed?'GEÇTİ':'BEKLE'}`)));
   setText('entryAudit',audit?`Giriş denetimi: ${audit.approved?'GEÇTİ':'BEKLE'} · Makas ${n(audit.spread_bps,2)} bp · Emir defteri üst kademe ${n(audit.min_top_notional_usdt,0)} / gereken ${n(audit.assumptions?.min_top_notional_usdt,0)} USDT · Referans uzaklığı ${n(audit.reference_departure_atr,2)} / sınır ${n(audit.reference_departure_limit_atr,3)} ATR · Varsayılan maliyet sonrası ödül / risk ${n(audit.assumed_net_risk_reward,2)} · ${(audit.reasons||[]).join(' · ')}`:'Güncel giriş denetimi bekleniyor.');
   const votes=pred?.ensemble; const voteText=votes?['LONG','SHORT'].map(side=>{const d=votes[side];return side+': '+(d?d.members.map(m=>`${m.name} ${prob(m.tp_score)} (ağırlık ${prob(m.weight)})`).join(' · ')+` · Uzlaşma ${d.agreement?'VAR':'YOK'}`:'oylama modeli yok')}).join(' | '):'Çoklu model eğitimi bekleniyor';
   setText('modelVotes',voteText);

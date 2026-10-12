@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from quality_guard import wilson_lower
 from paper_trade import _bracket
 from execution_policy import POLICY_VERSION, PAPER_NOTIONAL_USDT
+from order_depth import execution_book, visible_fill, MAX_IMPACT
 
 METHOD='bid_ask_funding_v72'
 FEE_PER_LEG=.0006
@@ -41,6 +42,8 @@ def setup(db):
 
 def valid_book(book, now_ms):
     try:
+        book=execution_book(book,now_ms,NOTIONAL)
+        if isinstance(book,dict) and book.get('source')=='depth20_snapshot' and not book.get('depth_approved'):return None
         bid,ask,bq,aq,stamp=[float(book[k]) for k in ('bid','ask','bid_qty','ask_qty','updated_at')]
         if not all(math.isfinite(v) for v in (bid,ask,bq,aq,stamp)):return None
         if not (0<bid<=ask and bq>0 and aq>0 and 0<=now_ms-stamp*1000<12000):return None
@@ -89,6 +92,18 @@ def reconcile_books(db,books,now_ms):
         if event-last>MAX_GAP_MS:
             db.execute("UPDATE executable_paper SET state='VERI_EKSIK',exit_reason='BOOK_GAP',last_quote_ms=? WHERE symbol=? AND candle_time=? AND model_version=? AND state='OPEN'",(event,*key));changed+=1;continue
         price=bid if side=='LONG' else ask
+        quantity=NOTIONAL/entry
+        raw=books.get(symbol) or {}
+        if raw.get('source')=='depth20_snapshot':
+            side_levels=raw['bids' if side=='LONG' else 'asks']
+            fill=visible_fill(side_levels,quantity=quantity)
+            if not fill or abs(fill['price']/side_levels[0][0]-1)>MAX_IMPACT:
+                # A sampled top-price touch is not a demonstrated full-size fill.
+                touched=(bid>=target or bid<=stop) if side=='LONG' else (ask<=target or ask>=stop)
+                if touched:
+                    db.execute("UPDATE executable_paper SET state='VERI_EKSIK',exit_reason='EXIT_DEPTH_UNKNOWN',last_quote_ms=? WHERE symbol=? AND candle_time=? AND model_version=?",(event,*key));changed+=1
+                continue
+            price=fill['price']
         tp=price>=target if side=='LONG' else price<=target
         sl=price<=stop if side=='LONG' else price>=stop
         if tp or sl:
@@ -96,7 +111,6 @@ def reconcile_books(db,books,now_ms):
             if tp:exit_price=min(target,exit_price) if side=='LONG' else max(target,exit_price)
             # If sufficient displayed size is missing, execution is unknown;
             # do not award a touch as a filled TP.
-            quantity=NOTIONAL/entry
             if (bq if side=='LONG' else aq)<quantity:
                 db.execute("UPDATE executable_paper SET state='VERI_EKSIK',exit_reason='EXIT_SIZE_UNKNOWN',last_quote_ms=? WHERE symbol=? AND candle_time=? AND model_version=?",(event,*key));changed+=1;continue
             gross=(1 if side=='LONG' else -1)*(exit_price/entry-1)

@@ -143,8 +143,8 @@ class ModelTests(unittest.TestCase):
             bars = candles()
             r = CoinModelRegistry(tmp)
             info = r.fit('BTCUSDT', bars)
-            self.assertEqual(info['artifact_schema'], 3)
-            self.assertEqual(info['training_pipeline_version'], 'v73')
+            self.assertEqual(info['artifact_schema'], 4)
+            self.assertEqual(info['training_pipeline_version'], TRAINING_PIPELINE_VERSION)
             self.assertEqual(info['decision_policy']['chosen_on'], 'chronological_validation_only')
             self.assertFalse(info['decision_policy']['holdout_used_for_selection'])
             # Synthetic data only verifies plumbing; no market performance claim.
@@ -161,7 +161,7 @@ class ModelTests(unittest.TestCase):
 class MigrationTests(unittest.TestCase):
     def current_info(self):
         return dict(model_family=MODEL_FAMILY, ensemble_policy=ENSEMBLE_POLICY,
-                    professional_policy=POLICY, artifact_schema=3,
+                    professional_policy=POLICY, artifact_schema=4,
                     training_pipeline_version=TRAINING_PIPELINE_VERSION,
                     trained_at=datetime.now(timezone.utc).isoformat(),
                     decision_policy=dict(version='validation_threshold_v1', threshold=.65,
@@ -196,7 +196,7 @@ class MigrationTests(unittest.TestCase):
                 r.metadata['BTCUSDT']['artifact_schema'] = schema
                 self.assertFalse(r.pipeline_ready('BTCUSDT'))
                 self.assertTrue(r.training_due('BTCUSDT'))
-            r.metadata['BTCUSDT']['artifact_schema'] = 3
+            r.metadata['BTCUSDT']['artifact_schema'] = 4
             r.metadata['BTCUSDT']['decision_policy']['chosen_on'] = 'holdout'
             self.assertFalse(r.pipeline_ready('BTCUSDT'))
             self.assertTrue(r.training_due('BTCUSDT'))

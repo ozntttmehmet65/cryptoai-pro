@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from quote_quality import quote_quality, MAX_QUOTE_AGE_SECONDS
 from execution_policy import POLICY_VERSION, PAPER_NOTIONAL_USDT, reference_departure_limit
+from order_depth import execution_book, MAX_IMPACT
 
 MAX_ENTRY_DELAY_MS = 900_000
 ASSUMED_COST = 0.0016
@@ -16,6 +17,10 @@ def entry_check(pred, quote, now_ms, book=None):
     reasons = []
     departure = net_reward = risk_reward = spread_bps = top_notional = break_even = None
     departure_limit = None
+    executable_departure = None
+    depth_book = execution_book(book,now_ms,PAPER_NOTIONAL_USDT)
+    depth_source = isinstance(book,dict) and book.get('source')=='depth20_snapshot'
+    book = depth_book
     checks = []
     def verify(key, label, passed):
         checks.append({"id":key, "label":label, "passed":bool(passed)})
@@ -54,13 +59,16 @@ def entry_check(pred, quote, now_ms, book=None):
         verify('book', 'Güncel alış-satış verisi yok; giriş bekletiliyor', 0 <= now_ms/1000-stamp < 12)
         spread = (ask-bid)/((ask+bid)/2)
         spread_bps = spread*10000
-        top_notional = min(bid*bq, ask*aq)
+        top_notional = book.get('depth_available_notional') if depth_source else min(bid*bq, ask*aq)
         verify('spread', 'Alış-satış makası fazla; giriş bekletiliyor',
                spread_bps <= MAX_SPREAD_BPS and spread <= atr_pct*MAX_SPREAD_ATR_FRACTION)
         verify('liquidity', f'Emir defterinde {MIN_TOP_NOTIONAL:g} USDT sanal işlem için yeterli alış/satış tutarı yok', top_notional >= MIN_TOP_NOTIONAL)
+        if depth_source and book.get('depth_error')!='size':
+            verify('depth_impact','100 USDT için görünür kademe kayması 2 baz puanı aşıyor',book.get('depth_approved') is True)
         executable = ask if (pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal'))=='LONG' else bid
+        executable_departure = abs(executable/reference-1)/atr_pct
         verify('executable', f'Alış/satış fiyatı izin verilen {limit_label} ATR referans sınırını aştı',
-               departure_limit is not None and abs(executable/reference-1)/atr_pct <= departure_limit + 1e-12)
+               departure_limit is not None and executable_departure <= departure_limit + 1e-12)
         side=pred.get('candidate_signal') if pred.get('signal')=='BEKLE' else pred.get('signal')
         if side in ('LONG','SHORT'):
             probability=float(pred['p_long' if side=='LONG' else 'p_short'])
@@ -75,12 +83,16 @@ def entry_check(pred, quote, now_ms, book=None):
     return {'approved': not reasons, 'reasons': reasons, 'checks':checks, 'policy_version':POLICY_VERSION,
             'quote_quality':quality,
             'spread_bps':spread_bps, 'min_top_notional_usdt':top_notional,
+            'liquidity_method':'depth20_vwap' if depth_source else 'best_level',
+            'depth_impact_bps':book.get('depth_impact',0)*10000 if depth_source and book else None,
             'conditional_stress_break_even':break_even,
             'assumptions':{'max_spread_bps':MAX_SPREAD_BPS,'min_top_notional_usdt':MIN_TOP_NOTIONAL,
                            'hypothetical_notional_usdt':PAPER_NOTIONAL_USDT,
+                           'max_depth_impact_bps':MAX_IMPACT*10000,
                            'max_reference_departure_atr':departure_limit,'stress_total_cost':STRESS_COST},
             'reference_departure_atr': departure,
             'reference_departure_limit_atr': departure_limit,
+            'executable_departure_atr':finite(executable_departure),
             'assumed_net_reward': net_reward, 'assumed_net_risk_reward': risk_reward,
             'notice': 'İhtiyatlı giriş politikasıdır; üst kademe tüm emir defteri değildir. Stres hesabı 24 saatte çözülen TP/SL koşuluna bağlı model puanını kullanır; canlı kâr beklentisi veya doğrulanmış başarı olasılığı değildir'}
 
@@ -109,7 +121,7 @@ def guarded_prediction(pred, quote, now_ms, permission, drift_blocked=False, *, 
             check['reasons'].append('Son canlı sanal sonuçlar olumsuz; yön güvenlik kilidi')
         check['approved'] = not check['reasons']
     result['execution_quality'] = check
-    if check['reasons']:
+    if check['reasons'] and side in ('LONG', 'SHORT'):
         result.update(signal='BEKLE', confidence=None,
                       candidate_signal=pred.get('candidate_signal') or (side if side in ('LONG', 'SHORT') else None),
                       blocked_reason=' · '.join(check['reasons']), execution_blocked=True)

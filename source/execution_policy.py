@@ -1,5 +1,5 @@
 """Shared entry sizing and bounded reference tolerance for paper execution."""
-POLICY_VERSION = 'V7.3.2'
+POLICY_VERSION = 'V7.4'
 PAPER_NOTIONAL_USDT = 100.0
 MAX_REFERENCE_DEPARTURE_ATR = 0.75
 MAX_BRACKET_DEPARTURE_FRACTION = 0.5
