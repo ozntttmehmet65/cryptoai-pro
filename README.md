@@ -1,5 +1,19 @@
 # CryptoAI Pro V7.3
 
+## V7.3.2 entry liquidity / reference tolerance
+
+- Replace the unrelated 1,000 USDT top-of-book minimum with the shared
+  100 USDT hypothetical paper notional. Both bid and ask still need to cover
+  that amount. This check describes visible exchange liquidity, not balance.
+- Replace fixed 0.35 ATR reference vetoes with `min(0.75, 0.5 * min(TP, SL))`
+  ATR for both last trade and executable bid/ask. The tolerance remains bounded
+  by half of either frozen bracket; stale data, spread, cost, model permission
+  and drift gates remain in force. This is a policy change, not demonstrated
+  improvement in TP performance.
+- Persist the new policy version in entry audits, count paper observations by
+  their recorded policy, and display the active policy's counts separately.
+  Existing positions keep their brackets and history.
+
 ## V7.3.1 live quote / timestamp repair
 
 - A single strict 10-second quote-freshness policy drives execution checks and
@@ -43,7 +57,7 @@ Older V7.1 voting artifacts are visible for audit but cannot approve a V7.2 dire
 
 ## Shared execution veto
 
-All market, detail, opportunity and paper-entry paths require current direction permission, fresh last quote (<10s), fresh bid/ask (<12s), entry within 15 minutes of candle close, displacement <=0.35 ATR, spread <=8bps and <=0.10 ATR, and >=1,000 quote units displayed on each best level. Stressed cost is 0.4% plus observed spread, with a five-point conditional-score margin. Global and symbol/model-specific forward drift vetoes use new approved observations. Consensus, regime, evidence and execution checks only veto; none can promote an otherwise unapproved model.
+All market, detail, opportunity and paper-entry paths require current direction permission, fresh last quote (<10s), fresh bid/ask (<12s), entry within 15 minutes of candle close, displacement <=min(0.75, 0.5 * min(TP ATR, SL ATR)), spread <=8bps and <=0.10 ATR, and >=100 USDT displayed on each best level to cover the hypothetical paper notional. Stressed cost is 0.4% plus observed spread, with a five-point conditional-score margin. Global and symbol/model-specific forward drift vetoes use new approved observations. Consensus, regime, evidence and execution checks only veto; none can promote an otherwise unapproved model.
 
 ## Run and verify
 
